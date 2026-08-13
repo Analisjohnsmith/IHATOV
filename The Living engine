@@ -1,5 +1,5 @@
 
-//! Core (open, BOL-OC 1.0): runtime, job scheduler, domain loader, chunked
+//! runtime, job scheduler, domain loader, chunked
 //! world container, event system. Domains (portable): Hella Engine,
 //! ValidatorSpiral, KittyOS, Marrowweave.
 //!
