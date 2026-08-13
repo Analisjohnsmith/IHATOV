@@ -4,9 +4,7 @@
 
                                                                                                                                                                                  
 
-
-
-                Maybe Pooh needs a few moments : Ihatovo Monogatari (1993, Super Famicom)
+Ihatovo Monogatari (1993, Super Famicom)
 
 This is the only full video game adaptation of Kenji Miyazawa’s world.
 Released exclusively in Japan, it is a narrative adventure game set in Ihatovo, the fictional utopian world Miyazawa described in his stories. The player explores the town, meets characters based on his works, and searches for Miyazawa’s lost journals.
