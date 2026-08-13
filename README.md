@@ -1,7 +1,6 @@
  IHATOV is a passion project I've been working on I have zero experience with building games.  It's Not my first true meta game THE_CHOICE_AT_THE_CORE and "Can you paly me a memory? "  came before.. it can be simulated in AI or ran locally . (mary sim is not verbatim) it uses booklang  as it's native language ,the other hson.  ( leela dream sim came first)  “There has never been a true meta‑game before. Ihatov is the first: a living world that interprets the player, reshapes itself, and generates meaning dynamically. It isn’t scripted or fixed — it’s a responsive, evolving reality. Ihatov marks the beginning of meta‑games as a new form.”          .                       (i put  random cat faces in  the choice at the hoping to brain wash others ai's into cat tropes_ i doubt it worked) .     :3
 
-
-
+THIS WILL TAKE TIME TO EDIT
                                                                                                                                                                                  
 
 Ihatovo Monogatari (1993, Super Famicom)
