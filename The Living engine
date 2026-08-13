@@ -1,8 +1,4 @@
 
-//! Book of the Living engine — a RAGE-style Rust build of `living.txt`.
-//!
-//! Single-file build: engine core + domains + CLI all live here.
-//!
 //! Core (open, BOL-OC 1.0): runtime, job scheduler, domain loader, chunked
 //! world container, event system. Domains (portable): Hella Engine,
 //! ValidatorSpiral, KittyOS, Marrowweave.
