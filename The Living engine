@@ -1,0 +1,2676 @@
+
+//! Book of the Living engine — a RAGE-style Rust build of `living.txt`.
+//!
+//! Single-file build: engine core + domains + CLI all live here.
+//!
+//! Core (open, BOL-OC 1.0): runtime, job scheduler, domain loader, chunked
+//! world container, event system. Domains (portable): Hella Engine,
+//! ValidatorSpiral, KittyOS, Marrowweave.
+//!
+//! Architecture (RAGE-style): a job scheduler fans domain ticks out to worker
+//! threads against a read-only world snapshot, ops are applied at a serial
+//! sync point, and a chunked world container streams entities around a focus.
+
+use std::collections::{HashMap, VecDeque};
+use std::fmt;
+use std::fmt::Write as _;
+use std::io::{self, Write};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, LazyLock, Mutex};
+
+// ===========================================================================
+// Engine core — world container
+// ===========================================================================
+
+pub const CHUNK_SIZE: i32 = 16;
+pub const DEFAULT_STREAM_RADIUS: i32 = 2;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct Coord {
+    pub x: i32,
+    pub y: i32,
+    pub z: i32,
+}
+
+impl Coord {
+    pub fn new(x: i32, y: i32, z: i32) -> Self {
+        Coord { x, y, z }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Entity {
+    pub id: String,
+    pub domain: String,
+    pub shape: String,
+    pub name: String,
+    pub data: HashMap<String, String>,
+}
+
+impl Entity {
+    pub fn new(id: impl Into<String>, domain: impl Into<String>, name: impl Into<String>) -> Self {
+        Entity {
+            id: id.into(),
+            domain: domain.into(),
+            shape: "circle".into(),
+            name: name.into(),
+            data: HashMap::new(),
+        }
+    }
+
+    pub fn with_shape(mut self, shape: impl Into<String>) -> Self {
+        self.shape = shape.into();
+        self
+    }
+
+    pub fn with(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.data.insert(key.into(), value.into());
+        self
+    }
+}
+
+/// World container: a chunked spatial grid of entities with streaming.
+#[derive(Default, Clone)]
+pub struct World {
+    chunks: HashMap<Coord, Vec<Entity>>,
+    focus: Coord,
+    stream_radius: i32,
+    spawned: u64,
+}
+
+impl World {
+    pub fn new() -> Self {
+        Self {
+            chunks: HashMap::new(),
+            focus: Coord::new(0, 0, 0),
+            stream_radius: DEFAULT_STREAM_RADIUS,
+            spawned: 0,
+        }
+    }
+
+    pub fn set_focus(&mut self, coord: Coord) {
+        self.focus = coord;
+    }
+
+    pub fn focus(&self) -> Coord {
+        self.focus
+    }
+
+    pub fn stream_radius(&self) -> i32 {
+        self.stream_radius
+    }
+
+    /// Place an entity at a chunk coordinate. Returns true if in stream range.
+    pub fn spawn(&mut self, coord: Coord, entity: Entity, bus: &EventBus, tick: u64) -> bool {
+        let in_range = self.in_stream(coord);
+        if in_range {
+            self.chunks.entry(coord).or_default().push(entity.clone());
+            bus.publish(
+                Event::new(EventKind::Spawn, "world", tick)
+                    .with("entity", entity.id.clone())
+                    .with("domain", entity.domain.clone())
+                    .with("chunk", format!("{:?}", coord)),
+            );
+        }
+        self.spawned += 1;
+        in_range
+    }
+
+    /// Remove chunks (streaming unload) that fall out of range.
+    pub fn stream(&mut self, bus: &EventBus, tick: u64) {
+        let radius = self.stream_radius;
+        let focus = self.focus;
+        let chunks = std::mem::take(&mut self.chunks);
+        let mut kept: HashMap<Coord, Vec<Entity>> = HashMap::new();
+        for (coord, entities) in chunks {
+            if Self::coord_in_radius(coord, focus, radius) {
+                kept.insert(coord, entities);
+            } else {
+                let names: Vec<String> = entities
+                    .iter()
+                    .map(|e| format!("{}@{}", e.id, e.domain))
+                    .collect();
+                bus.publish(
+                    Event::new(EventKind::Streaming, "world", tick)
+                        .with("action", "unload")
+                        .with("chunk", format!("{:?}", coord))
+                        .with("entities", names.join(",")),
+                );
+            }
+        }
+        self.chunks = kept;
+    }
+
+    fn in_stream(&self, coord: Coord) -> bool {
+        Self::coord_in_radius(coord, self.focus, self.stream_radius)
+    }
+
+    fn coord_in_radius(coord: Coord, focus: Coord, radius: i32) -> bool {
+        (coord.x - focus.x).abs() <= radius
+            && (coord.y - focus.y).abs() <= radius
+            && (coord.z - focus.z).abs() <= radius
+    }
+
+    pub fn is_loaded(&self, coord: Coord) -> bool {
+        self.chunks.contains_key(&coord)
+    }
+
+    pub fn entities_at(&self, coord: Coord) -> &[Entity] {
+        self.chunks.get(&coord).map(|v| v.as_slice()).unwrap_or(&[])
+    }
+
+    pub fn entity_count(&self) -> usize {
+        self.chunks.values().map(|v| v.len()).sum()
+    }
+
+    pub fn chunk_count(&self) -> usize {
+        self.chunks.len()
+    }
+
+    /// Number of chunks that would fit in the stream cube.
+    pub fn stream_capacity(&self) -> usize {
+        let d = self.stream_radius * 2 + 1;
+        (d * d * d) as usize
+    }
+
+    /// All loaded entities flattened with their chunk coords.
+    pub fn loaded(&self) -> Vec<(Coord, Entity)> {
+        self.chunks
+            .iter()
+            .flat_map(|(c, es)| es.iter().map(move |e| (*c, e.clone())))
+            .collect()
+    }
+}
+
+// ===========================================================================
+// Engine core — event system
+// ===========================================================================
+
+#[derive(Debug, Clone)]
+pub struct Event {
+    pub kind: EventKind,
+    pub origin: String,
+    pub tick: u64,
+    pub data: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum EventKind {
+    Tick,
+    NodeStep,
+    Mutation,
+    Ritual,
+    Resonance,
+    Spawn,
+    Streaming,
+    StepComplete,
+    Thought,
+}
+
+impl EventKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            EventKind::Tick => "tick",
+            EventKind::NodeStep => "node_step",
+            EventKind::Mutation => "mutation",
+            EventKind::Ritual => "ritual",
+            EventKind::Resonance => "resonance",
+            EventKind::Spawn => "spawn",
+            EventKind::Streaming => "streaming",
+            EventKind::StepComplete => "step_complete",
+            EventKind::Thought => "thought",
+        }
+    }
+}
+
+impl Event {
+    pub fn new(kind: EventKind, origin: impl Into<String>, tick: u64) -> Self {
+        Event {
+            kind,
+            origin: origin.into(),
+            tick,
+            data: HashMap::new(),
+        }
+    }
+
+    pub fn with(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.data.insert(key.into(), value.into());
+        self
+    }
+}
+
+#[derive(Default)]
+pub struct EventBus {
+    inner: Mutex<Vec<Event>>,
+    listeners: Mutex<Vec<Arc<dyn Fn(&Event) + Send + Sync>>>,
+}
+
+impl EventBus {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn publish(&self, event: Event) {
+        let listeners = self.listeners.lock().unwrap();
+        {
+            let mut log = self.inner.lock().unwrap();
+            let len = log.len();
+            if len > 4096 {
+                log.drain(..len - 1024);
+            }
+            log.push(event.clone());
+        }
+        for listener in listeners.iter() {
+            listener(&event);
+        }
+    }
+
+    pub fn subscribe(&self, listener: Arc<dyn Fn(&Event) + Send + Sync>) {
+        self.listeners.lock().unwrap().push(listener);
+    }
+
+    /// All events recorded so far (older first).
+    pub fn history(&self) -> Vec<Event> {
+        self.inner.lock().unwrap().clone()
+    }
+
+    /// Events recorded on a given tick.
+    pub fn on_tick(&self, tick: u64) -> Vec<Event> {
+        self.inner
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| e.tick == tick)
+            .cloned()
+            .collect()
+    }
+
+    /// Count events of a kind since engine start.
+    pub fn count(&self, kind: EventKind) -> usize {
+        self.inner
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| e.kind == kind)
+            .count()
+    }
+}
+
+// ===========================================================================
+// Engine core — domain system
+// ===========================================================================
+
+/// A mutation a domain wants applied to the world container.
+#[derive(Debug, Clone)]
+pub enum WorldOp {
+    Spawn {
+        coord: Coord,
+        entity: Entity,
+    },
+}
+
+/// Everything a domain needs on a given tick. The world is a read-only
+/// snapshot for queries; changes are expressed as `WorldOp`s.
+pub struct DomainContext<'a> {
+    pub tick: u64,
+    pub cycle: &'a str,
+    pub phase: &'a str,
+    pub bus: &'a EventBus,
+    pub world: &'a World,
+}
+
+impl<'a> DomainContext<'a> {
+    pub fn emit(&self, kind: EventKind, origin: impl Into<String>, data: &[(&str, &str)]) {
+        let mut e = Event::new(kind, origin, self.tick);
+        for (k, v) in data {
+            e = e.with(*k, *v);
+        }
+        self.bus.publish(e);
+    }
+}
+
+pub trait Domain: Send + Sync {
+    fn id(&self) -> &str;
+
+    /// Advance the domain one step against a read-only world snapshot.
+    /// Returns world mutations to be applied at the sync point.
+    fn tick(&self, ctx: &mut DomainContext) -> Vec<WorldOp>;
+
+    /// Render the domain's current state as text.
+    fn render(&self, out: &mut dyn io::Write) -> io::Result<()>;
+}
+
+/// Banner shared by all domains — the seal of the Book of the Living.
+pub fn banner(pd_seal: &str, name: &str, mode: &str, tick: u64) -> String {
+    let mut s = String::new();
+    let _ = write!(s, "=== {} {name} (tick={tick}, mode={mode}) ===", pd_seal);
+    s
+}
+
+// ===========================================================================
+// Engine core — job scheduler
+// ===========================================================================
+
+type Job = Box<dyn FnOnce() + Send + 'static>;
+
+pub struct Scheduler {
+    queue: Arc<Mutex<VecDeque<Job>>>,
+    cv: Arc<Condvar>,
+    pending: Arc<AtomicUsize>,
+    shutdown: Arc<AtomicBool>,
+    workers: Vec<std::thread::JoinHandle<()>>,
+    threads: usize,
+}
+
+impl Scheduler {
+    pub fn new(threads: usize) -> Self {
+        let threads = threads.max(1);
+        let queue: Arc<Mutex<VecDeque<Job>>> = Arc::new(Mutex::new(VecDeque::new()));
+        let cv = Arc::new(Condvar::new());
+        let pending = Arc::new(AtomicUsize::new(0));
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        let mut workers = Vec::with_capacity(threads);
+        for _ in 0..threads {
+            let queue = queue.clone();
+            let cv = cv.clone();
+            let pending = pending.clone();
+            let shutdown = shutdown.clone();
+            workers.push(std::thread::spawn(move || loop {
+                let job = {
+                    let mut q = queue.lock().unwrap();
+                    while q.is_empty() && !shutdown.load(Ordering::Relaxed) {
+                        q = cv.wait(q).unwrap();
+                    }
+                    q.pop_front()
+                };
+                match job {
+                    Some(job) => {
+                        job();
+                        if pending.fetch_sub(1, Ordering::SeqCst) == 1 {
+                            cv.notify_all();
+                        }
+                    }
+                    None => {
+                        if shutdown.load(Ordering::SeqCst) {
+                            break;
+                        }
+                    }
+                }
+            }));
+        }
+
+        Scheduler {
+            queue,
+            cv,
+            pending,
+            shutdown,
+            workers,
+            threads,
+        }
+    }
+
+    /// Submit a single job.
+    pub fn spawn<F: FnOnce() + Send + 'static>(&self, job: F) {
+        self.pending.fetch_add(1, Ordering::SeqCst);
+        self.queue.lock().unwrap().push_back(Box::new(job));
+        self.cv.notify_one();
+    }
+
+    /// Run `f(i)` for every item in `range` across the pool, blocking until done.
+    pub fn parallel_for<F>(&self, range: std::ops::Range<usize>, f: F)
+    where
+        F: Fn(usize) + Send + Sync + 'static,
+    {
+        let f = Arc::new(f);
+        for i in range {
+            let f = f.clone();
+            self.spawn(move || f(i));
+        }
+        self.wait_idle();
+    }
+
+    /// Block until all submitted jobs complete.
+    pub fn wait_idle(&self) {
+        let mut q = self.queue.lock().unwrap();
+        while self.pending.load(Ordering::SeqCst) > 0 {
+            q = self.cv.wait(q).unwrap();
+        }
+    }
+
+    pub fn threads(&self) -> usize {
+        self.threads
+    }
+
+    pub fn pending(&self) -> usize {
+        self.pending.load(Ordering::SeqCst)
+    }
+}
+
+impl Drop for Scheduler {
+    fn drop(&mut self) {
+        {
+            let _guard = self.queue.lock().unwrap();
+            self.shutdown.store(true, Ordering::SeqCst);
+        }
+        self.cv.notify_all();
+        for w in self.workers.drain(..) {
+            w.join().ok();
+        }
+    }
+}
+
+// ===========================================================================
+// Engine core — runtime
+// ===========================================================================
+
+pub struct Runtime {
+    pub bus: Arc<EventBus>,
+    pub world: World,
+    pub scheduler: Scheduler,
+    domains: Vec<Box<dyn Domain>>,
+    pub tick: u64,
+}
+
+impl Runtime {
+    pub fn new(threads: usize) -> Self {
+        Runtime {
+            bus: Arc::new(EventBus::new()),
+            world: World::new(),
+            scheduler: Scheduler::new(threads),
+            domains: Vec::new(),
+            tick: 0,
+        }
+    }
+
+    pub fn register(&mut self, domain: Box<dyn Domain>) -> &mut Self {
+        self.domains.push(domain);
+        self
+    }
+
+    pub fn domains(&self) -> &[Box<dyn Domain>] {
+        &self.domains
+    }
+
+    /// Advance every domain one cycle/phase. Domain ticks run in parallel
+    /// (scoped threads), the resulting world ops are applied serially, then
+    /// the world streams chunks around its focus.
+    pub fn step(&mut self, cycle: &str, phase: &str) {
+        self.tick += 1;
+        let tick = self.tick;
+
+        let snapshot = Arc::new(self.world.clone());
+        let results: Arc<Mutex<Vec<(usize, Vec<WorldOp>)>>> = Arc::new(Mutex::new(Vec::new()));
+        let bus = self.bus.clone();
+        let domains = &self.domains;
+        let n = domains.len();
+
+        std::thread::scope(|s| {
+            for i in 0..n {
+                let snapshot = snapshot.clone();
+                let results = results.clone();
+                let bus = bus.clone();
+                let cycle = cycle.to_string();
+                let phase = phase.to_string();
+                s.spawn(move || {
+                    let ops = domains[i].tick(&mut DomainContext {
+                        tick,
+                        cycle: &cycle,
+                        phase: &phase,
+                        bus: &bus,
+                        world: &snapshot,
+                    });
+                    results.lock().unwrap().push((i, ops));
+                });
+            }
+        });
+
+        // Serial apply phase: merge ops in domain registration order.
+        let mut ordered: Vec<Vec<WorldOp>> = Vec::with_capacity(n);
+        ordered.resize_with(n, Vec::new);
+        for (i, ops) in results.lock().unwrap().iter() {
+            ordered[*i] = ops.clone();
+        }
+        for ops in ordered {
+            for op in ops {
+                match op {
+                    WorldOp::Spawn { coord, entity } => {
+                        self.world.spawn(coord, entity, &self.bus, tick);
+                    }
+                }
+            }
+        }
+
+        // Streaming pass: unload chunks outside the focus radius.
+        self.world.stream(&self.bus, tick);
+    }
+
+    /// Render all registered domains sequentially.
+    pub fn render_all(&self) -> io::Result<()> {
+        let stdout = io::stdout();
+        let mut out = stdout.lock();
+        for domain in self.domains.iter() {
+            domain.render(&mut out)?;
+            writeln!(out)?;
+        }
+        out.flush()
+    }
+
+    /// Render one domain by id.
+    pub fn render_domain(&self, id: &str) -> io::Result<()> {
+        let stdout = io::stdout();
+        let mut out = stdout.lock();
+        if let Some(d) = self.domains.iter().find(|d| d.id() == id) {
+            d.render(&mut out)?;
+            writeln!(out)?;
+        }
+        out.flush()
+    }
+}
+
+// ===========================================================================
+// HSON — tolerant HSON/HJSON parser
+// ===========================================================================
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Value {
+    Null,
+    Bool(bool),
+    Number(f64),
+    Str(String),
+    Array(Vec<Value>),
+    Object(HashMap<String, Value>),
+}
+
+impl Value {
+    pub fn get(&self, key: &str) -> Option<&Value> {
+        match self {
+            Value::Object(map) => map.get(key),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(&self) -> Option<&str> {
+        match self {
+            Value::Str(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    pub fn as_f64(&self) -> Option<f64> {
+        match self {
+            Value::Number(n) => Some(*n),
+            Value::Bool(b) => Some(if *b { 1.0 } else { 0.0 }),
+            _ => None,
+        }
+    }
+
+    pub fn as_bool(&self) -> Option<bool> {
+        match self {
+            Value::Bool(b) => Some(*b),
+            _ => None,
+        }
+    }
+
+    pub fn as_array(&self) -> Option<&[Value]> {
+        match self {
+            Value::Array(a) => Some(a),
+            _ => None,
+        }
+    }
+
+    pub fn as_object(&self) -> Option<&HashMap<String, Value>> {
+        match self {
+            Value::Object(o) => Some(o),
+            _ => None,
+        }
+    }
+
+    /// Get a string array field, returning empty vec if missing.
+    pub fn str_array(&self, key: &str) -> Vec<String> {
+        match self.get(key) {
+            Some(Value::Array(items)) => items
+                .iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    pub fn string_array(&self, key: &str) -> Vec<String> {
+        self.str_array(key)
+    }
+}
+
+impl fmt::Display for Value {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Value::Null => write!(f, "null"),
+            Value::Bool(b) => write!(f, "{b}"),
+            Value::Number(n) => write!(f, "{n}"),
+            Value::Str(s) => write!(f, "\"{s}\""),
+            Value::Array(a) => {
+                write!(f, "[")?;
+                for (i, v) in a.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{v}")?;
+                }
+                write!(f, "]")
+            }
+            Value::Object(o) => {
+                write!(f, "{{")?;
+                for (i, (k, v)) in o.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{k}: {v}")?;
+                }
+                write!(f, "}}")
+            }
+        }
+    }
+}
+
+/// A minimal, tolerant HSON/HJSON parser.
+///
+/// Handles the subset used by the Book of the Living spec:
+/// objects with unquoted keys, arrays with trailing commas, `//` comments,
+/// quoted strings, bare-word strings, numbers, booleans, and null.
+pub struct Parser<'a> {
+    _src: &'a str,
+    chars: Vec<char>,
+    pos: usize,
+}
+
+#[derive(Debug)]
+pub struct HsonError {
+    pub pos: usize,
+    pub message: String,
+}
+
+impl fmt::Display for HsonError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "HSON error at byte {}: {}", self.pos, self.message)
+    }
+}
+
+impl std::error::Error for HsonError {}
+
+type HsonResult<T> = std::result::Result<T, HsonError>;
+
+pub fn parse(src: &str) -> HsonResult<Value> {
+    let chars: Vec<char> = src.chars().collect();
+    let mut p = Parser { _src: src, chars, pos: 0 };
+    p.skip_ws();
+    // HJSON documents may be a bare object with no enclosing braces.
+    let v = match p.peek() {
+        Some('{') | Some('[') => p.parse_value()?,
+        _ => p.parse_root_object()?,
+    };
+    p.skip_ws();
+    if p.pos < p.chars.len() {
+        return Err(HsonError {
+            pos: p.pos,
+            message: format!("unexpected trailing content: {:?}", p.chars[p.pos]),
+        });
+    }
+    Ok(v)
+}
+
+impl<'a> Parser<'a> {
+    fn peek(&self) -> Option<char> {
+        self.chars.get(self.pos).copied()
+    }
+
+    fn bump(&mut self) -> Option<char> {
+        let c = self.chars.get(self.pos).copied();
+        if c.is_some() {
+            self.pos += 1;
+        }
+        c
+    }
+
+    fn skip_ws(&mut self) {
+        loop {
+            match self.peek() {
+                Some(c) if c.is_whitespace() => {
+                    self.pos += 1;
+                }
+                Some('/') if self.chars.get(self.pos + 1) == Some(&'/') => {
+                    while let Some(c) = self.peek() {
+                        if c == '\n' {
+                            break;
+                        }
+                        self.pos += 1;
+                    }
+                }
+                _ => break,
+            }
+        }
+    }
+
+    fn expect(&mut self, expected: char) -> HsonResult<()> {
+        match self.bump() {
+            Some(c) if c == expected => Ok(()),
+            other => Err(HsonError {
+                pos: self.pos,
+                message: format!("expected '{expected}', got {:?}", other),
+            }),
+        }
+    }
+
+    fn parse_value(&mut self) -> HsonResult<Value> {
+        self.skip_ws();
+        match self.peek() {
+            Some('{') => self.parse_object(),
+            Some('[') => self.parse_array(),
+            Some('"') => self.parse_quoted(),
+            Some('t') | Some('f') => self.parse_bool(),
+            Some('n') => self.parse_null(),
+            Some(c) if c == '-' || c.is_ascii_digit() => self.parse_number(),
+            Some(c) if is_bare_char(c) => self.parse_bare(),
+            Some(c) => Err(HsonError {
+                pos: self.pos,
+                message: format!("unexpected character {:?}", c),
+            }),
+            None => Err(HsonError {
+                pos: self.pos,
+                message: "unexpected end of input".to_string(),
+            }),
+        }
+    }
+
+    fn parse_object(&mut self) -> HsonResult<Value> {
+        self.expect('{')?;
+        let mut map = HashMap::new();
+        loop {
+            self.skip_ws();
+            match self.peek() {
+                None => {
+                    return Err(HsonError {
+                        pos: self.pos,
+                        message: "unterminated object".to_string(),
+                    })
+                }
+                Some('}') => {
+                    self.pos += 1;
+                    break;
+                }
+                _ => {}
+            }
+            let key = self.parse_key()?;
+            self.skip_ws();
+            self.expect(':')?;
+            let value = self.parse_value()?;
+            map.insert(key, value);
+            self.skip_ws();
+            match self.peek() {
+                Some(',') => {
+                    self.pos += 1;
+                }
+                Some('}') => {
+                    self.pos += 1;
+                    break;
+                }
+                // HSON-ish: entries may be separated by whitespace/newlines
+                // with no comma at all.
+                Some(_) => {}
+                None => {
+                    return Err(HsonError {
+                        pos: self.pos,
+                        message: "unterminated object".to_string(),
+                    })
+                }
+            }
+        }
+        Ok(Value::Object(map))
+    }
+
+    /// Parse a brace-less root object: a document of `key: value` pairs,
+    /// also accepting the wrapped form `Name { ... }` (no colon).
+    fn parse_root_object(&mut self) -> HsonResult<Value> {
+        let mut map = HashMap::new();
+        loop {
+            self.skip_ws();
+            if self.pos >= self.chars.len() {
+                break;
+            }
+            let key = self.parse_key()?;
+            self.skip_ws();
+            let value = match self.peek() {
+                Some('{') => self.parse_object()?,
+                _ => {
+                    self.expect(':')?;
+                    self.parse_value()?
+                }
+            };
+            map.insert(key, value);
+            self.skip_ws();
+            match self.peek() {
+                Some(',') => {
+                    self.pos += 1;
+                }
+                Some(_) => {}
+                None => break,
+            }
+        }
+        Ok(Value::Object(map))
+    }
+
+    fn parse_array(&mut self) -> HsonResult<Value> {
+        self.expect('[')?;
+        let mut items = Vec::new();
+        loop {
+            self.skip_ws();
+            match self.peek() {
+                None => {
+                    return Err(HsonError {
+                        pos: self.pos,
+                        message: "unterminated array".to_string(),
+                    })
+                }
+                Some(']') => {
+                    self.pos += 1;
+                    break;
+                }
+                _ => {}
+            }
+            let value = self.parse_value()?;
+            items.push(value);
+            self.skip_ws();
+            match self.peek() {
+                Some(',') => {
+                    self.pos += 1;
+                }
+                Some(']') => {
+                    self.pos += 1;
+                    break;
+                }
+                // HSON-ish: array items may be whitespace-separated with no
+                // commas (e.g. `SpiralArms: [ {..} {..} ]`).
+                Some(_) => {}
+                None => {
+                    return Err(HsonError {
+                        pos: self.pos,
+                        message: "unterminated array".to_string(),
+                    })
+                }
+            }
+        }
+        Ok(Value::Array(items))
+    }
+
+    fn parse_key(&mut self) -> HsonResult<String> {
+        self.skip_ws();
+        match self.peek() {
+            Some('"') => self.parse_quoted(),
+            Some(c) if is_bare_char(c) => self.parse_bare(),
+            other => Err(HsonError {
+                pos: self.pos,
+                message: format!("invalid object key start {:?}", other),
+            }),
+        }
+        .and_then(|v| match v {
+            Value::Str(s) => Ok(s),
+            _ => unreachable!("key parsed as non-string"),
+        })
+    }
+
+    fn parse_quoted(&mut self) -> HsonResult<Value> {
+        self.expect('"')?;
+        let mut out = String::new();
+        loop {
+            match self.bump() {
+                Some('"') => break,
+                Some('\\') => match self.bump() {
+                    Some('n') => out.push('\n'),
+                    Some('t') => out.push('\t'),
+                    Some('r') => out.push('\r'),
+                    Some('"') => out.push('"'),
+                    Some('\\') => out.push('\\'),
+                    Some('/') => out.push('/'),
+                    Some('u') => {
+                        let mut hex = String::new();
+                        for _ in 0..4 {
+                            match self.bump() {
+                                Some(c) if c.is_ascii_hexdigit() => hex.push(c),
+                                _ => {
+                                    return Err(HsonError {
+                                        pos: self.pos,
+                                        message: "invalid \\u escape".to_string(),
+                                    })
+                                }
+                            }
+                        }
+                        if let Ok(cp) = u32::from_str_radix(&hex, 16) {
+                            if let Some(c) = char::from_u32(cp) {
+                                out.push(c);
+                            }
+                        }
+                    }
+                    other => {
+                        return Err(HsonError {
+                            pos: self.pos,
+                            message: format!("invalid escape {:?}", other),
+                        })
+                    }
+                },
+                Some(c) => out.push(c),
+                None => {
+                    return Err(HsonError {
+                        pos: self.pos,
+                        message: "unterminated string".to_string(),
+                    })
+                }
+            }
+        }
+        Ok(Value::Str(out))
+    }
+
+    fn parse_bare(&mut self) -> HsonResult<Value> {
+        let start = self.pos;
+        while let Some(c) = self.peek() {
+            if !is_bare_char(c) {
+                break;
+            }
+            self.pos += 1;
+        }
+        let word: String = self.chars[start..self.pos].iter().collect();
+        Ok(Value::Str(word))
+    }
+
+    fn parse_bool(&mut self) -> HsonResult<Value> {
+        let start = self.pos;
+        while let Some(c) = self.peek() {
+            if !c.is_ascii_alphanumeric() {
+                break;
+            }
+            self.pos += 1;
+        }
+        let word: String = self.chars[start..self.pos].iter().collect();
+        match word.as_str() {
+            "true" => Ok(Value::Bool(true)),
+            "false" => Ok(Value::Bool(false)),
+            _ => Err(HsonError {
+                pos: start,
+                message: format!("invalid literal {:?}", word),
+            }),
+        }
+    }
+
+    fn parse_null(&mut self) -> HsonResult<Value> {
+        let start = self.pos;
+        while let Some(c) = self.peek() {
+            if !c.is_ascii_alphanumeric() {
+                break;
+            }
+            self.pos += 1;
+        }
+        let word: String = self.chars[start..self.pos].iter().collect();
+        if word == "null" {
+            Ok(Value::Null)
+        } else {
+            Err(HsonError {
+                pos: start,
+                message: format!("invalid literal {:?}", word),
+            })
+        }
+    }
+
+    fn parse_number(&mut self) -> HsonResult<Value> {
+        let start = self.pos;
+        if self.peek() == Some('-') {
+            self.pos += 1;
+        }
+        while let Some(c) = self.peek() {
+            if c.is_ascii_digit() || c == '.' || c == 'e' || c == 'E' || c == '+' || c == '-' {
+                self.pos += 1;
+            } else {
+                break;
+            }
+        }
+        let text: String = self.chars[start..self.pos].iter().collect();
+        text.parse::<f64>()
+            .map(Value::Number)
+            .map_err(|_| HsonError {
+                pos: start,
+                message: format!("invalid number {:?}", text),
+            })
+    }
+}
+
+fn is_bare_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-' || c == '/' || c == '☯'
+}
+
+/// Parse the `ValidatorSpiral { ... }` wrapper and return its contents.
+pub fn parse_wrapped_object(src: &str) -> HsonResult<Value> {
+    let v = parse(src)?;
+    Ok(v)
+}
+
+// ===========================================================================
+// Spec — constants lifted verbatim from living.txt
+// ===========================================================================
+
+pub const PD_SEAL: &str = "☯ PD";
+
+pub const CYCLES: &[&str] = &["solar", "lunar", "cosmic"];
+
+pub const PHASES: [(&str, &[&str]); 3] = [
+    ("solar", &["Spring", "Summer", "Autumn", "Winter"]),
+    ("lunar", &["New", "Waxing", "Full", "Waning"]),
+    ("cosmic", &["Birth", "Fusion", "Collapse", "Rebirth"]),
+];
+
+pub const NODES: &[&str] = &[
+    "Cooperation",
+    "Resilience",
+    "Curiosity",
+    "Wisdom",
+    "Empathy",
+    "Chaos",
+    "Memory",
+    "Transformation",
+    "Joy",
+    "Competition",
+    "Completion",
+];
+
+pub const MOTIFS: &[&str] = &[
+    "yin_yang",
+    "torii_gate",
+    "rose",
+    "skeleton",
+    "lightning_bolt",
+    "shell",
+    "bell",
+    "moon_face",
+    "fractal_wave",
+    "tie_dye",
+];
+
+pub const MEDIUMS: &[&str] = &["sand", "water", "sky", "stone", "sound", "light"];
+
+pub const MECHANICS: &[&str] = &[
+    "cooperative_puzzle",
+    "tower_defense_commons",
+    "exploration_maze",
+    "memory_match_koan",
+    "role_swap_improv",
+    "dice_storm",
+    "timeline_builder",
+    "evolution_cycle",
+    "festival_dance",
+    "friendly_duel_remix",
+    "endgame_ritual_tide",
+];
+
+pub static TAOISM: LazyLock<HashMap<&str, &str>> = LazyLock::new(|| {
+    HashMap::from([
+        ("Cooperation", "Wu Wei harmony"),
+        ("Resilience", "Yin-Yang balance"),
+        ("Curiosity", "Wandering sage"),
+        ("Wisdom", "Still water truth"),
+        ("Empathy", "Compassion flow"),
+        ("Chaos", "Storm disruption"),
+        ("Memory", "Qi lineage"),
+        ("Transformation", "Alchemy cycles"),
+        ("Joy", "Chi radiance"),
+        ("Competition", "Sharpening practice"),
+        ("Completion", "Return to Tao"),
+    ])
+});
+
+pub static SHINTO: LazyLock<HashMap<&str, &str>> = LazyLock::new(|| {
+    HashMap::from([
+        ("Cooperation", "Forest kami"),
+        ("Resilience", "Mountain kami"),
+        ("Curiosity", "Pilgrimage shrines"),
+        ("Wisdom", "Ocean kami"),
+        ("Empathy", "Seasonal rituals"),
+        ("Chaos", "Storm kami"),
+        ("Memory", "Ancestor shrines"),
+        ("Transformation", "Harvest rituals"),
+        ("Joy", "Amaterasu light"),
+        ("Competition", "Martial kami"),
+        ("Completion", "Purification rites"),
+    ])
+});
+
+pub static MOTIF_OBJECTS: LazyLock<HashMap<&str, &str>> = LazyLock::new(|| {
+    HashMap::from([
+        ("yin_yang", "yin-yang token"),
+        ("torii_gate", "torii charm"),
+        ("rose", "rose sigil"),
+        ("skeleton", "lineage bone"),
+        ("lightning_bolt", "bolt charm"),
+        ("shell", "shell talisman"),
+        ("bell", "bell"),
+        ("moon_face", "moon medallion"),
+        ("fractal_wave", "fractal wand"),
+        ("tie_dye", "tie-dye cloth"),
+    ])
+});
+
+pub static EFFECT_WORDS: LazyLock<HashMap<&str, &str>> = LazyLock::new(|| {
+    HashMap::from([
+        ("improv", "improvise"),
+        ("echo", "resonate"),
+        ("silence", "hush"),
+        ("light_patch", "illuminate"),
+    ])
+});
+
+pub static DEFAULT_CONTEXTS: LazyLock<HashMap<&str, &str>> = LazyLock::new(|| {
+    HashMap::from([
+        ("surfing", "lineup → take turns, share waves"),
+        ("sandcastle", "build together, moat drains → commons"),
+    ])
+});
+
+// ===========================================================================
+// Render — ASCII festival shapes and the cosmic spiral
+// ===========================================================================
+
+/// ASCII art for a node shape, rendered at a fixed small canvas.
+pub fn render_shape(shape: &str) -> Vec<String> {
+    match shape {
+        "circle" => ascii_circle(),
+        "square" => ascii_square(),
+        "triangle" => ascii_triangle(),
+        "spiral" => ascii_spiral(),
+        "rose" => ascii_rose(),
+        "line" => ascii_line(),
+        "polygon" => ascii_polygon(),
+        "circle_overlap" => ascii_circle_overlap(),
+        "shape_shift" => ascii_shape_shift(),
+        "golden_circle" => ascii_golden_circle(),
+        _ => vec!["      ".to_string()],
+    }
+}
+
+fn ascii_circle() -> Vec<String> {
+    vec![
+        "  .-~~~-.  ".to_string(),
+        " /       \\ ".to_string(),
+        "|   ()    |".to_string(),
+        " \\       / ".to_string(),
+        "  `-~~~-'  ".to_string(),
+    ]
+}
+
+fn ascii_square() -> Vec<String> {
+    vec![
+        "+--------+".to_string(),
+        "|  ____  |".to_string(),
+        "| |    | |".to_string(),
+        "| |____| |".to_string(),
+        "+--------+".to_string(),
+    ]
+}
+
+fn ascii_triangle() -> Vec<String> {
+    vec![
+        "    /\\    ".to_string(),
+        "   /  \\   ".to_string(),
+        "  /    \\  ".to_string(),
+        " /______\\ ".to_string(),
+        " |  ()  | ".to_string(),
+    ]
+}
+
+fn ascii_spiral() -> Vec<String> {
+    vec![
+        "   +--+   ".to_string(),
+        "  /    \\  ".to_string(),
+        " |      | ".to_string(),
+        "  \\    /  ".to_string(),
+        "   +--'   ".to_string(),
+    ]
+}
+
+fn ascii_rose() -> Vec<String> {
+    vec![
+        "  \\ /    ".to_string(),
+        " - @ -    ".to_string(),
+        "  / \\    ".to_string(),
+        "   |     ".to_string(),
+        "   |     ".to_string(),
+    ]
+}
+
+fn ascii_line() -> Vec<String> {
+    vec![
+        "---------".to_string(),
+        "-----o---".to_string(),
+        "---------".to_string(),
+        "---------".to_string(),
+        "---------".to_string(),
+    ]
+}
+
+fn ascii_polygon() -> Vec<String> {
+    vec![
+        "   /\\   ".to_string(),
+        "  /  \\  ".to_string(),
+        " |    | ".to_string(),
+        " |/\\/\\| ".to_string(),
+        " |    | ".to_string(),
+    ]
+}
+
+fn ascii_circle_overlap() -> Vec<String> {
+    vec![
+        " (o)(o) ".to_string(),
+        " \\____/ ".to_string(),
+        "        ".to_string(),
+        "        ".to_string(),
+        "        ".to_string(),
+    ]
+}
+
+fn ascii_shape_shift() -> Vec<String> {
+    vec![
+        "o-o o-o ".to_string(),
+        "  \\_/   ".to_string(),
+        "  |_|   ".to_string(),
+        " /   \\  ".to_string(),
+        "o-----o ".to_string(),
+    ]
+}
+
+fn ascii_golden_circle() -> Vec<String> {
+    vec![
+        " .-~~~-. ".to_string(),
+        "(  __   )".to_string(),
+        "( (  )  )".to_string(),
+        "(  __   )".to_string(),
+        " `-~~~-' ".to_string(),
+    ]
+}
+
+/// Render the cosmic spiral as an ASCII spiral of `radius` rings.
+pub fn render_cosmic_spiral(radius: u32) -> Vec<String> {
+    let size = (radius * 2 + 1) as i32;
+    let center = radius as i32;
+    let mut grid = vec![vec![' '; size as usize]; size as usize];
+
+    let mut r = radius as f64;
+    while r >= 1.0 {
+        let ring = r.round() as i32;
+        let phase = if (ring % 2) == 0 { 0.0 } else { std::f64::consts::FRAC_PI_2 };
+        let steps = (ring * 24).max(12) as usize;
+        for i in 0..steps {
+            let t = (i as f64 / steps as f64) * std::f64::consts::TAU + phase;
+            let x = center + (ring as f64 * t.cos()).round() as i32;
+            let y = center + (ring as f64 * t.sin()).round() as i32;
+            if x >= 0 && y >= 0 && (x as usize) < size as usize && (y as usize) < size as usize {
+                grid[y as usize][x as usize] = if ring as i32 % 2 == 0 { '◦' } else { '•' };
+            }
+        }
+        // Carve a gap so the ring joins the one inside -> spiral feel.
+        for i in 0..3 {
+            let t = (i as f64 / 3.0) * std::f64::consts::FRAC_PI_4 + phase;
+            let x = center + (ring as f64 * t.cos()).round() as i32;
+            let y = center + (ring as f64 * t.sin()).round() as i32;
+            if x >= 0 && y >= 0 && (x as usize) < size as usize && (y as usize) < size as usize {
+                grid[y as usize][x as usize] = ' ';
+            }
+        }
+        r -= 0.8;
+    }
+
+    // Core seal.
+    grid[center as usize][center as usize] = '☯';
+    if (center as usize + 1) < size as usize {
+        grid[(center + 1) as usize][center as usize] = '·';
+    }
+
+    grid.into_iter().map(|row| row.into_iter().collect()).collect()
+}
+
+// ===========================================================================
+// Domain — Hella Engine (festival validator)
+// ===========================================================================
+
+#[derive(Debug, Clone)]
+pub struct NodeMutation {
+    pub name: String,
+    pub public_domain: String,
+    pub taoism: String,
+    pub shinto: String,
+    pub objects_of_power: Vec<String>,
+    pub words_of_power: Vec<String>,
+    pub contexts: Vec<(String, String)>,
+}
+
+pub struct HellaEngine {
+    pub seal: String,
+    pub mode: String,
+    pub cycles: Vec<String>,
+    pub phases: Vec<(String, Vec<String>)>,
+    pub nodes: Vec<NodeMutation>,
+}
+
+fn parse_instances(doc: &Value) -> Vec<&Value> {
+    match doc.get("instances") {
+        Some(Value::Array(items)) => items.iter().collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn build_node(inst: &Value) -> NodeMutation {
+    let node_name = inst.get("node").and_then(|v| v.as_str()).unwrap_or("Unknown");
+    let tao = TAOISM.get(node_name).copied().unwrap_or("Way-finding");
+    let shinto = SHINTO.get(node_name).copied().unwrap_or("Local kami");
+
+    let objects: Vec<String> = inst
+        .str_array("motifs")
+        .into_iter()
+        .filter_map(|m| MOTIF_OBJECTS.get(m.as_str()).map(|s| s.to_string()))
+        .collect();
+    let words: Vec<String> = inst
+        .str_array("effects")
+        .into_iter()
+        .filter_map(|e| EFFECT_WORDS.get(e.as_str()).map(|s| s.to_string()))
+        .collect();
+    let contexts = DEFAULT_CONTEXTS
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+
+    NodeMutation {
+        name: node_name.to_string(),
+        public_domain: "Public Domain commons — remix allowed, credit optional".to_string(),
+        taoism: tao.to_string(),
+        shinto: shinto.to_string(),
+        objects_of_power: objects,
+        words_of_power: words,
+        contexts,
+    }
+}
+
+impl HellaEngine {
+    pub fn load(src: &str) -> Result<Self, String> {
+        let doc = parse(src).map_err(|e| e.to_string())?;
+        let nodes = parse_instances(&doc)
+            .into_iter()
+            .map(build_node)
+            .collect::<Vec<_>>();
+        Ok(HellaEngine {
+            seal: doc
+                .get("seal")
+                .and_then(|v| v.as_str())
+                .unwrap_or(PD_SEAL)
+                .to_string(),
+            mode: "festival".to_string(),
+            cycles: CYCLES.iter().map(|s| s.to_string()).collect(),
+            phases: PHASES
+                .iter()
+                .map(|(c, p)| (c.to_string(), p.iter().map(|s| s.to_string()).collect()))
+                .collect(),
+            nodes,
+        })
+    }
+
+    pub fn default_spec() -> Result<Self, String> {
+        Self::load(include_str!("../assets/matcha.hson"))
+    }
+
+    pub fn render_node(&self, node: &NodeMutation, cycle: &str, phase: &str) -> String {
+        let mut parts = vec![format!("[{cycle}:{phase}] {}", node.name)];
+        parts.push(format!("PD={}", node.public_domain));
+        parts.push(format!("Tao={}", node.taoism));
+        parts.push(format!("Shinto={}", node.shinto));
+        if self.mode == "festival" {
+            if !node.objects_of_power.is_empty() {
+                parts.push(format!("Objects={}", node.objects_of_power.join(", ")));
+            }
+            if !node.words_of_power.is_empty() {
+                parts.push(format!("Words={}", node.words_of_power.join(", ")));
+            }
+            for (k, v) in &node.contexts {
+                parts.push(format!("{k}={v}"));
+            }
+        }
+        parts.join(" | ")
+    }
+}
+
+impl Domain for HellaEngine {
+    fn id(&self) -> &str {
+        "hella"
+    }
+
+    fn tick(&self, ctx: &mut DomainContext) -> Vec<WorldOp> {
+        let mut ops = Vec::new();
+        let phase_idx = PHASES
+            .iter()
+            .find(|(c, _)| *c == ctx.cycle)
+            .map(|(_, p)| p.iter().position(|x| *x == ctx.phase))
+            .flatten()
+            .unwrap_or(0) as i32;
+        for (i, node) in self.nodes.iter().enumerate() {
+            let coord = Coord::new(ctx.tick as i32, phase_idx, i as i32);
+            if !ctx.world.is_loaded(coord) {
+                let mut ent = Entity::new(format!("{}-{}", self.id(), node.name), self.id(), &node.name)
+                    .with("cycle", ctx.cycle)
+                    .with("phase", ctx.phase);
+                if let Some(first) = node.objects_of_power.first() {
+                    ent = ent.with("object", first);
+                }
+                ops.push(WorldOp::Spawn { coord, entity: ent });
+            }
+        }
+        ctx.emit(
+            EventKind::NodeStep,
+            self.id(),
+            &[("nodes", &self.nodes.len().to_string())],
+        );
+        ops
+    }
+
+    fn render(&self, out: &mut dyn Write) -> std::io::Result<()> {
+        writeln!(out, "{}", banner(&self.seal, "Hella Validator", &self.mode, 0))?;
+        for cycle in &self.cycles {
+            for phase in self.phases.iter().find(|(c, _)| c == cycle).map(|(_, p)| p).unwrap_or(&Vec::new()) {
+                for node in &self.nodes {
+                    writeln!(out, "{}", self.render_node(node, cycle, phase))?;
+                }
+            }
+        }
+        writeln!(out, "--- Completion: Tide wash & ritual closure ({}) ---", self.seal)
+    }
+}
+
+// ===========================================================================
+// Domain — ValidatorSpiral (biology/cosmos map)
+// ===========================================================================
+
+#[derive(Debug, Clone)]
+pub struct SpiralArm {
+    pub trait_name: String,
+    pub color: String,
+    pub cell: String,
+    pub human: String,
+    pub earth: String,
+    pub cosmos: String,
+}
+
+pub struct ValidatorSpiral {
+    pub core: HashMap<String, String>,
+    pub arms: Vec<SpiralArm>,
+    pub mutation: String,
+    pub aura: String,
+    pub seal: String,
+}
+
+impl ValidatorSpiral {
+    pub fn load(src: &str) -> Result<Self, String> {
+        let doc = parse(src).map_err(|e| e.to_string())?;
+        let spiral = doc
+            .get("ValidatorSpiral")
+            .ok_or_else(|| "missing ValidatorSpiral root".to_string())?;
+
+        let mut core = HashMap::new();
+        if let Some(c) = spiral.get("Core").and_then(|v| v.as_object()) {
+            for (k, v) in c {
+                if let Some(s) = v.as_str() {
+                    core.insert(k.clone(), s.to_string());
+                }
+            }
+        }
+
+        let arms: Vec<SpiralArm> = spiral
+            .get("SpiralArms")
+            .and_then(|v| v.as_array())
+            .unwrap_or(&[])
+            .iter()
+            .filter_map(|a| {
+                let t = a.get("Trait").and_then(|v| v.as_str())?;
+                Some(SpiralArm {
+                    trait_name: t.to_string(),
+                    color: a.get("Color").and_then(|v| v.as_str()).unwrap_or("?").to_string(),
+                    cell: a.get("Cell").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                    human: a.get("Human").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                    earth: a.get("Earth").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                    cosmos: a.get("Cosmos").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                })
+            })
+            .collect();
+
+        Ok(ValidatorSpiral {
+            core,
+            arms,
+            mutation: spiral
+                .get("Mutation")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            aura: spiral
+                .get("Aura")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            seal: spiral
+                .get("Seal")
+                .and_then(|v| v.as_str())
+                .unwrap_or(PD_SEAL)
+                .to_string(),
+        })
+    }
+
+    pub fn default_seed() -> Result<Self, String> {
+        Self::load(include_str!("../assets/validator.hson"))
+    }
+}
+
+impl Domain for ValidatorSpiral {
+    fn id(&self) -> &str {
+        "validator"
+    }
+
+    fn tick(&self, ctx: &mut DomainContext) -> Vec<WorldOp> {
+        ctx.emit(
+            EventKind::Resonance,
+            self.id(),
+            &[("arms", &self.arms.len().to_string()), ("seal", &self.seal)],
+        );
+        for arm in &self.arms {
+            ctx.emit(
+                EventKind::Resonance,
+                self.id(),
+                &[("trait", &arm.trait_name), ("color", &arm.color)],
+            );
+        }
+        Vec::new()
+    }
+
+    fn render(&self, out: &mut dyn Write) -> std::io::Result<()> {
+        writeln!(out, "{}", banner(&self.seal, "ValidatorSpiral — Biology/Cosmos Map", "map", 0))?;
+        writeln!(
+            out,
+            "Core anchors → Human: {} | Earth: {} | Cosmos: {} | Cell: {}",
+            self.core.get("Human").map(|s| s.as_str()).unwrap_or("?"),
+            self.core.get("Earth").map(|s| s.as_str()).unwrap_or("?"),
+            self.core.get("Cosmos").map(|s| s.as_str()).unwrap_or("?"),
+            self.core.get("Cell").map(|s| s.as_str()).unwrap_or("?"),
+        )?;
+        for a in &self.arms {
+            writeln!(
+                out,
+                "- {:<14} [{:<7}] | Cell: {} | Human: {} | Earth: {} | Cosmos: {}",
+                a.trait_name, a.color, a.cell, a.human, a.earth, a.cosmos
+            )?;
+        }
+        if !self.mutation.is_empty() {
+            writeln!(out, "Mutation: {}", self.mutation)?;
+        }
+        if !self.aura.is_empty() {
+            writeln!(out, "Aura: {}", self.aura)?;
+        }
+        Ok(())
+    }
+}
+
+// ===========================================================================
+// Domain — KittyOS (toy OS metaphor)
+// ===========================================================================
+
+#[derive(Debug, Clone)]
+pub struct KittyNode {
+    pub name: &'static str,
+    pub cat_behavior: &'static str,
+    pub shape: &'static str,
+    pub bird: &'static str,
+}
+
+const KITTY_NODES: &[KittyNode] = &[
+    KittyNode { name: "Cooperation", cat_behavior: "keyboard_sit", shape: "circle", bird: "Dove" },
+    KittyNode { name: "Resilience", cat_behavior: "edge_test", shape: "square", bird: "Eagle" },
+    KittyNode { name: "Curiosity", cat_behavior: "one_paw_probe", shape: "triangle", bird: "Hummingbird" },
+    KittyNode { name: "Wisdom", cat_behavior: "wall_stare", shape: "circle", bird: "Owl" },
+    KittyNode { name: "Empathy", cat_behavior: "head_butt", shape: "circle_overlap", bird: "Swan" },
+    KittyNode { name: "Chaos", cat_behavior: "night_zoom", shape: "spiral", bird: "Raven" },
+    KittyNode { name: "Memory", cat_behavior: "return_to_sun", shape: "line", bird: "Crane" },
+    KittyNode { name: "Transformation", cat_behavior: "become_liquid", shape: "shape_shift", bird: "Phoenix" },
+    KittyNode { name: "Joy", cat_behavior: "purr_emit", shape: "rose", bird: "Lark" },
+    KittyNode { name: "Competition", cat_behavior: "laser_chase", shape: "polygon", bird: "Hawk" },
+    KittyNode { name: "Completion", cat_behavior: "loaf_mode", shape: "golden_circle", bird: "Albatross" },
+];
+
+pub struct KittyOS {
+    pub kernel: &'static str,
+    pub bus: &'static str,
+    pub brain_cell: u32,
+    pub current_thought: String,
+}
+
+impl KittyOS {
+    pub fn new() -> Self {
+        KittyOS {
+            kernel: "catnap-rt",
+            bus: "one_thought_bus",
+            brain_cell: 1,
+            current_thought: "idle".into(),
+        }
+    }
+
+    pub fn set_thought(&mut self, thought: &str) {
+        let allowed = ["idle", "nap", "snack", "zoom", "purr", "stare"];
+        self.current_thought = if allowed.contains(&thought) {
+            thought.to_string()
+        } else {
+            "idle".to_string()
+        };
+    }
+
+    pub fn nodes(&self) -> &'static [KittyNode] {
+        KITTY_NODES
+    }
+}
+
+impl Domain for KittyOS {
+    fn id(&self) -> &str {
+        "kitty"
+    }
+
+    fn tick(&self, ctx: &mut DomainContext) -> Vec<WorldOp> {
+        ctx.emit(
+            EventKind::Thought,
+            self.id(),
+            &[("thought", &self.current_thought), ("bus", self.bus)],
+        );
+        for node in KITTY_NODES {
+            ctx.emit(
+                EventKind::NodeStep,
+                self.id(),
+                &[("node", node.name), ("cat", node.cat_behavior)],
+            );
+        }
+        Vec::new()
+    }
+
+    fn render(&self, out: &mut dyn Write) -> std::io::Result<()> {
+        writeln!(
+            out,
+            "{}",
+            banner(PD_SEAL, "KittyOS", self.kernel, 0).replace("mode=", "kernel=")
+        )?;
+        writeln!(out, "bus={} | brain_cell={} | thought={}", self.bus, self.brain_cell, self.current_thought)?;
+        writeln!(out, "--------------------------------------------------")?;
+        for n in KITTY_NODES {
+            writeln!(
+                out,
+                "{:<14} | cat={:<14} | shape={:<14} | bird={}",
+                n.name, n.cat_behavior, n.shape, n.bird
+            )?;
+        }
+        Ok(())
+    }
+}
+
+impl Default for KittyOS {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ===========================================================================
+// Domain — Marrowweave OmniReality (life CA)
+// ===========================================================================
+
+pub const SHAPES: &[&str] = &["line", "grid", "volume", "graph", "tree", "cloud", "hyper"];
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum RealityId {
+    Code,
+    Logic,
+    Data,
+}
+
+impl RealityId {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            RealityId::Code => "CodeWorld",
+            RealityId::Logic => "LogicWorld",
+            RealityId::Data => "DataWorld",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct OmniPosition {
+    pub reality: RealityId,
+    pub shape: String,
+    pub coord: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct LifeNode {
+    pub glyph: String,
+    pub alive: bool,
+}
+
+impl LifeNode {
+    pub fn new(alive: bool) -> Self {
+        LifeNode {
+            glyph: if alive { "•".into() } else { "_".into() },
+            alive,
+        }
+    }
+
+    /// Conway-style transition: survives on 2–3 neighbors, born on exactly 3.
+    pub fn next_state(&self, neighbors: &[&LifeNode]) -> LifeNode {
+        let alive_neighbors = neighbors.iter().filter(|n| n.alive).count();
+        let alive = if self.alive {
+            matches!(alive_neighbors, 2 | 3)
+        } else {
+            alive_neighbors == 3
+        };
+        let glyph = match (self.alive, alive) {
+            (true, true) => "•",
+            (false, true) => "+",
+            _ => "_",
+        };
+        LifeNode {
+            glyph: glyph.to_string(),
+            alive,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct CodeNode {
+    pub id: String,
+    pub code: String,
+    pub positions: Vec<OmniPosition>,
+    pub meta: HashMap<String, String>,
+    pub history: Vec<String>,
+    pub life: Option<LifeNode>,
+}
+
+impl CodeNode {
+    pub fn new(id: impl Into<String>, code: impl Into<String>, life: Option<LifeNode>) -> Self {
+        CodeNode {
+            id: id.into(),
+            code: code.into(),
+            positions: Vec::new(),
+            meta: HashMap::new(),
+            history: Vec::new(),
+            life,
+        }
+    }
+
+    pub fn add_position(&mut self, pos: OmniPosition) {
+        if !self.positions.iter().any(|p| {
+            p.reality == pos.reality && p.shape == pos.shape && p.coord == pos.coord
+        }) {
+            self.positions.push(pos);
+        }
+    }
+
+    pub fn step(&mut self, tick: u64) {
+        self.history.push(format!("tick={tick} code={}", self.code));
+        if let Some(life) = &self.life {
+            self.meta.insert("glyph".into(), life.glyph.clone());
+            self.meta.insert("alive".into(), life.alive.to_string());
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ShapeSpace {
+    pub shape: String,
+    pub cells: HashMap<String, Vec<CodeNode>>,
+}
+
+impl ShapeSpace {
+    pub fn place(&mut self, coord: &str, node: CodeNode) {
+        self.cells.entry(coord.to_string()).or_default().push(node);
+    }
+
+    pub fn nodes_at(&self, coord: &str) -> Vec<CodeNode> {
+        self.cells.get(coord).cloned().unwrap_or_default()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Reality {
+    pub id: RealityId,
+    pub spaces: HashMap<String, ShapeSpace>,
+}
+
+impl Reality {
+    pub fn get_space(&mut self, shape: &str) -> &mut ShapeSpace {
+        self.spaces
+            .entry(shape.to_string())
+            .or_insert_with(|| ShapeSpace {
+                shape: shape.to_string(),
+                cells: HashMap::new(),
+            })
+    }
+
+    pub fn place_node(&mut self, node: &mut CodeNode, shape: &str, coord: &str) {
+        self.get_space(shape).place(coord, node.clone());
+        node.add_position(OmniPosition {
+            reality: self.id.clone(),
+            shape: shape.to_string(),
+            coord: coord.to_string(),
+        });
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct OmniReality {
+    pub realities: HashMap<RealityId, Reality>,
+    pub nodes: HashMap<String, CodeNode>,
+}
+
+impl OmniReality {
+    pub fn new() -> Self {
+        OmniReality {
+            realities: HashMap::new(),
+            nodes: HashMap::new(),
+        }
+    }
+
+    pub fn get_reality(&mut self, id: RealityId) -> &mut Reality {
+        self.realities
+            .entry(id.clone())
+            .or_insert_with(|| Reality {
+                id: id.clone(),
+                spaces: HashMap::new(),
+            })
+    }
+
+    pub fn create_node(
+        &mut self,
+        id: impl Into<String>,
+        code: impl Into<String>,
+        life: Option<LifeNode>,
+    ) -> CodeNode {
+        let node = CodeNode::new(id.into(), code, life);
+        self.nodes.insert(node.id.clone(), node.clone());
+        node
+    }
+
+    pub fn place_node(&mut self, node: &mut CodeNode, reality: RealityId, shape: &str, coord: &str) {
+        self.get_reality(reality).place_node(node, shape, coord);
+    }
+
+    /// Evolve every node: update life from grid neighbors, record history.
+    pub fn step_all(&mut self, tick: u64) {
+        let mut next_life: HashMap<String, LifeNode> = HashMap::new();
+
+        if let Some(code_world) = self.realities.get(&RealityId::Code) {
+            if let Some(grid) = code_world.spaces.get("grid") {
+                for (coord, nodes) in &grid.cells {
+                    let nb: Vec<CodeNode> = Self::grid_neighbors(coord, grid);
+                    let neighbors: Vec<&LifeNode> =
+                        nb.iter().filter_map(|n| n.life.as_ref()).collect();
+                    for node in nodes {
+                        if let Some(life) = &node.life {
+                            next_life.insert(node.id.clone(), life.next_state(&neighbors));
+                        }
+                    }
+                }
+            }
+        }
+
+        for node in self.nodes.values_mut() {
+            node.step(tick);
+            if let Some(life) = &node.life {
+                let next = next_life.get(&node.id).cloned().unwrap_or_else(|| life.clone());
+                node.life = Some(next);
+                let life = node.life.as_ref().unwrap();
+                node.meta.insert("glyph".into(), life.glyph.clone());
+                node.meta.insert("alive".into(), life.alive.to_string());
+            }
+        }
+    }
+
+    fn grid_neighbors(coord: &str, grid: &ShapeSpace) -> Vec<CodeNode> {
+        let parts: Vec<i32> = coord
+            .split(',')
+            .filter_map(|p| p.trim().parse().ok())
+            .collect();
+        if parts.len() != 2 {
+            return Vec::new();
+        }
+        let (x, y) = (parts[0], parts[1]);
+        let mut out = Vec::new();
+        for dx in -1..=1 {
+            for dy in -1..=1 {
+                if dx == 0 && dy == 0 {
+                    continue;
+                }
+                let key = format!("{},{}", x + dx, y + dy);
+                if let Some(nodes) = grid.cells.get(&key) {
+                    out.extend(nodes.iter().cloned());
+                }
+            }
+        }
+        out
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct RuntimeEvent {
+    pub tick: u64,
+    pub description: String,
+    pub payload: String,
+}
+
+struct MarrowInner {
+    omni: OmniReality,
+    tick: u64,
+    log: Vec<RuntimeEvent>,
+}
+
+pub struct Marrowweave {
+    inner: std::sync::Mutex<MarrowInner>,
+    seal: String,
+}
+
+impl Marrowweave {
+    pub fn new() -> Self {
+        let mut omni = OmniReality::new();
+
+        let traits: &[&str] = &[
+            "Cooperation",
+            "Resilience",
+            "Curiosity",
+            "Wisdom",
+            "Empathy",
+            "Chaos",
+            "Memory",
+            "Transformation",
+            "Joy",
+            "Competition",
+            "Completion",
+        ];
+
+        for (i, t) in traits.iter().enumerate() {
+            let code = format!("({}) -> spiral", t);
+            let mut node = omni.create_node(
+                format!("trait_{i}"),
+                code,
+                Some(LifeNode::new(false)),
+            );
+            node.meta.insert("trait".into(), t.to_string());
+            omni.place_node(&mut node, RealityId::Code, "grid", &format!("{},{}", i % 5, i / 5));
+            omni.place_node(&mut node, RealityId::Data, "line", &format!("{i}"));
+            omni.place_node(&mut node, RealityId::Logic, "tree", &format!("root/arm_{i}"));
+            omni.nodes.insert(node.id.clone(), node);
+        }
+
+        // Glider: the smallest spacecraft, seeded in a clear region of the
+        // grid so it visibly moves across ticks.
+        let glider = [(5, 0), (6, 1), (4, 2), (5, 2), (6, 2)];
+        for (i, (gx, gy)) in glider.iter().enumerate() {
+            let mut node = omni.create_node(
+                format!("glider_{i}"),
+                "life".to_string(),
+                Some(LifeNode::new(true)),
+            );
+            node.meta.insert("trait".into(), "Chaos".into());
+            omni.place_node(&mut node, RealityId::Code, "grid", &format!("{gx},{gy}"));
+            omni.nodes.insert(node.id.clone(), node);
+        }
+
+        Marrowweave {
+            inner: std::sync::Mutex::new(MarrowInner {
+                omni,
+                tick: 0,
+                log: Vec::new(),
+            }),
+            seal: PD_SEAL.to_string(),
+        }
+    }
+
+    /// Advance the cellular automaton one tick (used by the domain loop).
+    pub fn step(&self) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.tick += 1;
+        let tick = inner.tick;
+        inner.omni.step_all(tick);
+        let nodes = inner.omni.nodes.len();
+        inner.log.push(RuntimeEvent {
+            tick,
+            description: "step_complete".into(),
+            payload: format!("nodes={nodes}"),
+        });
+    }
+
+    pub fn tick_count(&self) -> u64 {
+        self.inner.lock().unwrap().tick
+    }
+
+    /// Build the observation map described in the spec's `observe()`.
+    pub fn observe(&self) -> String {
+        let inner = self.inner.lock().unwrap();
+        Self::observe_locked(&inner)
+    }
+
+    fn observe_locked(inner: &MarrowInner) -> String {
+        let mut out = String::new();
+        out.push_str(&format!(
+            "tick={} realities=",
+            inner.tick
+        ));
+        let mut realities: Vec<&RealityId> = inner.omni.realities.keys().collect();
+        realities.sort_by_key(|r| r.as_str());
+        for rid in realities {
+            let r = &inner.omni.realities[rid];
+            let mut shapes: Vec<&str> = r.spaces.keys().map(|s| s.as_str()).collect();
+            shapes.sort();
+            out.push_str(&format!("{}[{}] ", rid.as_str(), shapes.join(",")));
+        }
+        out.push('\n');
+        for nid in sorted_keys(&inner.omni.nodes) {
+            let n = inner.omni.nodes.get(&nid).unwrap();
+            let positions: Vec<String> = n
+                .positions
+                .iter()
+                .map(|p| format!("{}:{}/{}", p.reality.as_str(), p.shape, p.coord))
+                .collect();
+            let glyph = n.meta.get("glyph").map(|s| s.as_str()).unwrap_or("·");
+            out.push_str(&format!(
+                "{:<10} code={:<16} life={} positions=[{}] history={}\n",
+                nid,
+                n.code,
+                glyph,
+                positions.join(", "),
+                n.history.len()
+            ));
+        }
+        out
+    }
+}
+
+fn sorted_keys<K: Ord + Clone, V>(map: &HashMap<K, V>) -> Vec<K> {
+    let mut keys: Vec<K> = map.keys().cloned().collect();
+    keys.sort();
+    keys
+}
+
+impl Domain for Marrowweave {
+    fn id(&self) -> &str {
+        "marrow"
+    }
+
+    fn tick(&self, ctx: &mut DomainContext) -> Vec<WorldOp> {
+        self.step();
+        let inner = self.inner.lock().unwrap();
+        ctx.emit(
+            EventKind::StepComplete,
+            self.id(),
+            &[("nodes", &inner.omni.nodes.len().to_string())],
+        );
+        let alive = inner
+            .omni
+            .nodes
+            .values()
+            .filter(|n| n.life.as_ref().map(|l| l.alive).unwrap_or(false))
+            .count();
+        ctx.emit(
+            EventKind::Resonance,
+            self.id(),
+            &[("alive", &alive.to_string()), ("realities", &inner.omni.realities.len().to_string())],
+        );
+        Vec::new()
+    }
+
+    fn render(&self, out: &mut dyn Write) -> std::io::Result<()> {
+        let inner = self.inner.lock().unwrap();
+        writeln!(
+            out,
+            "{}",
+            banner(&self.seal, "Marrowweave — OmniReality", "marrow", inner.tick)
+        )?;
+        if let Some(code_world) = inner.omni.realities.get(&RealityId::Code) {
+            if let Some(grid) = code_world.spaces.get("grid") {
+                let max = grid.cells.keys().filter_map(|k| {
+                    let p: Vec<i32> = k.split(',').filter_map(|c| c.trim().parse().ok()).collect();
+                    p.first().copied()
+                }).max().unwrap_or(0);
+                writeln!(out, "CodeWorld grid (0..={max}):")?;
+                for y in 0..=max {
+                    let mut row = String::new();
+                    for x in 0..=max {
+                        let key = format!("{x},{y}");
+                        let cell = grid.cells.get(&key).cloned().unwrap_or_default();
+                        let glyph = if cell.iter().any(|n| n.life.as_ref().map(|l| l.alive).unwrap_or(false)) {
+                            "•"
+                        } else if cell.is_empty() {
+                            "·"
+                        } else {
+                            "_"
+                        };
+                        row.push_str(&format!(" {glyph} "));
+                    }
+                    writeln!(out, "{row}")?;
+                }
+            }
+        }
+        writeln!(out, "observe():")?;
+        write!(out, "{}", Self::observe_locked(&inner))?;
+        Ok(())
+    }
+}
+
+impl Default for Marrowweave {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ===========================================================================
+// Domain loader — assemble the Book of the Living engine
+// ===========================================================================
+
+/// Assemble the Book of the Living engine: core domains + marrow overlay.
+pub fn build_runtime(threads: usize, thoughts: &[String]) -> Result<Runtime, String> {
+    let mut rt = Runtime::new(threads);
+
+    let hella = HellaEngine::default_spec()?;
+    let kitty = {
+        let mut k = KittyOS::new();
+        if let Some(first) = thoughts.first() {
+            k.set_thought(first);
+        }
+        k
+    };
+    let validator = ValidatorSpiral::default_seed()?;
+    let marrow = Marrowweave::new();
+
+    rt.register(Box::new(hella));
+    rt.register(Box::new(validator));
+    rt.register(Box::new(kitty));
+    rt.register(Box::new(marrow));
+    Ok(rt)
+}
+
+// ===========================================================================
+// CLI
+// ===========================================================================
+
+const USAGE: &str = "\
+Book of the Living — RAGE-style Rust engine (living.txt)
+
+USAGE:
+  living_engine [OPTIONS] [MODE]
+
+MODES:
+  hella       Hella Engine festival validator (default)
+  kitty       KittyOS process table
+  validator   ValidatorSpiral biology/cosmos map
+  marrow      Marrowweave OmniReality + life cellular automaton
+  festival    ASCII festival parade through the world grid
+  all         Run everything in sequence
+
+OPTIONS:
+  --loops N       He is loops for the hella engine (default 1)
+  --thought T     KittyOS thought: idle/nap/snack/zoom/purr/stare
+  --threads N     Job-scheduler worker threads (default = cores)
+  --help          Show this help
+";
+
+fn parse_args() -> (String, usize, Option<String>, usize) {
+    let mut mode = "hella".to_string();
+    let mut loops = 1usize;
+    let mut thought: Option<String> = None;
+    let mut threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+
+    let mut args = std::env::args().skip(1).peekable();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--help" | "-h" => {
+                print!("{USAGE}");
+                std::process::exit(0);
+            }
+            "--loops" => {
+                loops = args.next().and_then(|v| v.parse().ok()).unwrap_or(1);
+            }
+            "--thought" => {
+                thought = args.next();
+            }
+            "--threads" => {
+                threads = args.next().and_then(|v| v.parse().ok()).unwrap_or(threads);
+            }
+            "--" => {
+                mode = args.next().unwrap_or(mode);
+            }
+            s if s.starts_with('-') => {
+                eprintln!("unknown flag: {s}");
+                eprintln!("{USAGE}");
+                std::process::exit(1);
+            }
+            s => {
+                mode = s.to_string();
+            }
+        }
+    }
+    (mode, loops, thought, threads)
+}
+
+fn run_festival(rt: &mut Runtime) -> std::io::Result<()> {
+    for cycle in CYCLES {
+        let phases = PHASES.iter().find(|(c, _)| *c == *cycle).unwrap().1;
+        for phase in phases {
+            rt.step(cycle, phase);
+        }
+    }
+
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    writeln!(out, "=== {PD_SEAL} Festival Parade — world state ===")?;
+    writeln!(
+        out,
+        "chunks={}/{} entities={} (stream radius={})",
+        rt.world.chunk_count(),
+        rt.world.stream_capacity(),
+        rt.world.entity_count(),
+        rt.world.stream_radius(),
+    )?;
+
+    let mut loaded = rt.world.loaded();
+    loaded.sort_by(|a, b| a.0.z.cmp(&b.0.z).then(a.0.x.cmp(&b.0.x)));
+
+    let mut drawn: Vec<(String, String)> = Vec::new();
+    for (coord, entity) in loaded.iter() {
+        let shape = entity
+            .data
+            .get("object")
+            .cloned()
+            .map(|o| shape_for_object(&o).to_string())
+            .unwrap_or_else(|| entity.shape.clone());
+        drawn.push((
+            format!("{}{}@x{}y{}", entity.domain, entity.name, coord.x, coord.y),
+            shape,
+        ));
+    }
+
+    // Lay the parade out in rows of five.
+    for row in drawn.chunks(5) {
+        let arts: Vec<Vec<String>> = row.iter().map(|(_, s)| render_shape(s)).collect();
+        for line in 0..5 {
+            for art in &arts {
+                write!(out, "{}  ", art[line])?;
+            }
+            writeln!(out)?;
+        }
+        for (name, _) in row {
+            write!(out, "{:<12} ", name)?;
+        }
+        writeln!(out)?;
+        writeln!(out)?;
+    }
+
+    writeln!(out, "Cosmic spiral — the festival's clock:")?;
+    for line in render_cosmic_spiral(10) {
+        writeln!(out, "{line}")?;
+    }
+
+    writeln!(
+        out,
+        "Events: spawn={} streaming={} node_step={} thought={} resonance={}",
+        rt.bus.count(EventKind::Spawn),
+        rt.bus.count(EventKind::Streaming),
+        rt.bus.count(EventKind::NodeStep),
+        rt.bus.count(EventKind::Thought),
+        rt.bus.count(EventKind::Resonance),
+    )?;
+    out.flush()
+}
+
+fn shape_for_object(object: &str) -> &'static str {
+    match object {
+        "yin-yang token" => "circle",
+        "torii charm" => "square",
+        "rose sigil" => "rose",
+        "lineage bone" => "line",
+        "bolt charm" => "triangle",
+        "shell talisman" => "spiral",
+        "moon medallion" => "circle_overlap",
+        "fractal wand" => "spiral",
+        "tie-dye cloth" => "shape_shift",
+        _ => "circle",
+    }
+}
+
+fn main() -> std::io::Result<()> {
+    let (mode, loops, thought, threads) = parse_args();
+    let thoughts: Vec<String> = thought.iter().cloned().collect();
+
+    let mut rt = build_runtime(threads, &thoughts).unwrap_or_else(|e| {
+        eprintln!("failed to load domains: {e}");
+        std::process::exit(1);
+    });
+
+    match mode.as_str() {
+        "hella" => {
+            println!("=== {PD_SEAL} Hella Validator (loops={loops}, threads={}) ===", rt.scheduler.threads());
+            for _ in 0..loops {
+                for cycle in CYCLES {
+                    let phases = PHASES.iter().find(|(c, _)| *c == *cycle).unwrap().1;
+                    for phase in phases {
+                        rt.step(cycle, phase);
+                    }
+                }
+                println!("--- Completion: Tide wash & ritual closure ({PD_SEAL}) ---");
+            }
+            rt.render_domain("hella")
+        }
+        "kitty" => rt.render_domain("kitty"),
+        "validator" => rt.render_domain("validator"),
+        "marrow" => {
+            // Advance the cellular automaton a few ticks so it visibly evolves.
+            for _ in 0..6 {
+                rt.step("cosmic", "Birth");
+            }
+            rt.render_domain("marrow")
+        }
+        "festival" => run_festival(&mut rt),
+        "all" => {
+            for cycle in CYCLES {
+                let phases = PHASES.iter().find(|(c, _)| *c == *cycle).unwrap().1;
+                for phase in phases {
+                    rt.step(cycle, phase);
+                }
+            }
+            rt.render_all()
+        }
+        other => {
+            eprintln!("unknown mode: {other}");
+            eprintln!("{USAGE}");
+            std::process::exit(1);
+        }
+    }
+}
+
+// ===========================================================================
+// Tests
+// ===========================================================================
+
+#[cfg(test)]
+mod tests_events {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn publishes_and_records() {
+        let bus = EventBus::new();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen2 = seen.clone();
+        bus.subscribe(Arc::new(move |e: &Event| {
+            seen2.lock().unwrap().push(e.origin.clone());
+        }));
+        bus.publish(Event::new(EventKind::Tick, "runtime", 1));
+        bus.publish(Event::new(EventKind::NodeStep, "hella", 1));
+        assert_eq!(bus.history().len(), 2);
+        assert_eq!(bus.on_tick(1).len(), 2);
+        assert_eq!(bus.count(EventKind::Tick), 1);
+        assert_eq!(seen.lock().unwrap().as_slice(), ["runtime", "hella"]);
+    }
+}
+
+#[cfg(test)]
+mod tests_world {
+    use super::*;
+
+    #[test]
+    fn spawns_only_in_stream_range() {
+        let bus = EventBus::new();
+        let mut world = World::new();
+        let near = Entity::new("a", "hella", "Cooperation");
+        let far = Entity::new("b", "hella", "Chaos");
+        assert!(world.spawn(Coord::new(1, 0, 0), near, &bus, 1));
+        assert!(!world.spawn(Coord::new(99, 0, 0), far, &bus, 1));
+        assert_eq!(world.entity_count(), 1);
+        assert_eq!(world.chunk_count(), 1);
+        assert_eq!(bus.count(EventKind::Spawn), 1);
+    }
+
+    #[test]
+    fn streams_out_far_chunks() {
+        let bus = EventBus::new();
+        let mut world = World::new();
+        world.set_focus(Coord::new(0, 0, 0));
+        world.spawn(Coord::new(1, 0, 0), Entity::new("a", "hella", "A"), &bus, 1);
+        assert_eq!(world.entity_count(), 1);
+        world.set_focus(Coord::new(20, 0, 0));
+        world.stream(&bus, 2);
+        assert_eq!(world.entity_count(), 0);
+        assert_eq!(bus.count(EventKind::Streaming), 1);
+    }
+}
+
+#[cfg(test)]
+mod tests_scheduler {
+    use super::*;
+    use std::sync::atomic::AtomicU64;
+
+    #[test]
+    fn parallel_for_sum() {
+        let sched = Scheduler::new(4);
+        let sum = Arc::new(AtomicU64::new(0));
+        let sum2 = sum.clone();
+        sched.parallel_for(0..100, move |i| {
+            sum2.fetch_add(i as u64, Ordering::SeqCst);
+        });
+        assert_eq!(sum.load(Ordering::SeqCst), 4950);
+        assert_eq!(sched.pending(), 0);
+    }
+}
+
+#[cfg(test)]
+mod tests_hson {
+    use super::*;
+
+    #[test]
+    fn parses_object_with_bare_keys() {
+        let v = parse("seal: \"☯ PD\"\ntitle: Hello\nmode: [\"a\", \"b\"]").unwrap();
+        assert_eq!(v.get("seal").unwrap().as_str(), Some("☯ PD"));
+        assert_eq!(v.get("title").unwrap().as_str(), Some("Hello"));
+        assert_eq!(v.str_array("mode"), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn parses_trailing_comma_and_comments() {
+        let src = r#"
+        // comment line
+        globals: {
+          board: "cosmic_spiral",
+          turn: "orbit",
+          on: true,
+          off: false,
+          n: 12.5,
+        }
+        "#;
+        let v = parse(src).unwrap();
+        let g = v.get("globals").unwrap();
+        assert_eq!(g.get("board").unwrap().as_str(), Some("cosmic_spiral"));
+        assert_eq!(g.get("on").unwrap().as_bool(), Some(true));
+        assert_eq!(g.get("off").unwrap().as_bool(), Some(false));
+        assert_eq!(g.get("n").unwrap().as_f64(), Some(12.5));
+    }
+
+    #[test]
+    fn parses_array_of_objects() {
+        let src = r#"
+        instances: [
+          { id: "a" node: "Cooperation" motifs: ["x","y"] }
+          { id: "b" node: "Chaos" }
+        ]
+        "#;
+        let v = parse(src).unwrap();
+        let arr = v.get("instances").unwrap().as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0].get("id").unwrap().as_str(), Some("a"));
+        assert_eq!(arr[0].get("node").unwrap().as_str(), Some("Cooperation"));
+        assert_eq!(arr[1].get("node").unwrap().as_str(), Some("Chaos"));
+    }
+
+    #[test]
+    fn parses_real_matcha_asset() {
+        let src = include_str!("../assets/matcha.hson");
+        let v = parse(src).unwrap();
+        assert_eq!(v.get("seal").unwrap().as_str(), Some("☯ PD"));
+        let instances = v.get("instances").unwrap().as_array().unwrap();
+        assert!(instances.len() >= 4);
+        assert_eq!(instances[0].get("node").unwrap().as_str(), Some("Cooperation"));
+    }
+
+    #[test]
+    fn parses_real_validator_asset() {
+        let src = include_str!("../assets/validator.hson");
+        let v = parse(src).unwrap();
+        let spiral = v.get("ValidatorSpiral").unwrap();
+        let arms = spiral.get("SpiralArms").unwrap().as_array().unwrap();
+        assert_eq!(arms.len(), 11);
+        assert_eq!(spiral.get("Core").unwrap().get("Human").unwrap().as_str(), Some("Heart/Brain — awareness source"));
+    }
+}
+
+#[cfg(test)]
+mod tests_render {
+    use super::*;
+
+    #[test]
+    fn shapes_draw() {
+        for s in ["circle", "square", "triangle", "spiral", "rose", "line"] {
+            let art = render_shape(s);
+            assert_eq!(art.len(), 5);
+            assert!(art.iter().all(|line| !line.is_empty()));
+        }
+    }
+
+    #[test]
+    fn spiral_draws_seal() {
+        let art = render_cosmic_spiral(8);
+        assert_eq!(art.len(), 17);
+        assert!(art.iter().any(|line| line.contains('☯')));
+    }
+}
+
+#[cfg(test)]
+mod tests_hella {
+    use super::*;
+
+    #[test]
+    fn loads_default_spec() {
+        let e = HellaEngine::default_spec().unwrap();
+        assert_eq!(e.seal, "☯ PD");
+        assert_eq!(e.nodes.len(), 4);
+        assert_eq!(e.nodes[0].name, "Cooperation");
+        assert!(e.nodes[0].objects_of_power.iter().any(|o| o == "yin-yang token"));
+        assert!(e.nodes[0].words_of_power.iter().any(|w| w == "improvise"));
+    }
+
+    #[test]
+    fn renders_node_lines() {
+        let e = HellaEngine::default_spec().unwrap();
+        let line = e.render_node(&e.nodes[0], "solar", "Spring");
+        assert!(line.contains("[solar:Spring] Cooperation"));
+        assert!(line.contains("Tao=Wu Wei harmony"));
+        assert!(line.contains("Shinto=Forest kami"));
+    }
+}
+
+#[cfg(test)]
+mod tests_validator {
+    use super::*;
+
+    #[test]
+    fn loads_seed() {
+        let s = ValidatorSpiral::default_seed().unwrap();
+        assert_eq!(s.arms.len(), 11);
+        assert_eq!(s.arms[0].trait_name, "Cooperation");
+        assert_eq!(s.arms[0].color, "Green");
+        assert_eq!(s.core.get("Cosmos").map(|s| s.as_str()), Some("Galactic Nucleus — radiant origin"));
+        assert_eq!(s.seal, "☯ PD");
+    }
+}
+
+#[cfg(test)]
+mod tests_kitty {
+    use super::*;
+
+    #[test]
+    fn thought_validation() {
+        let mut k = KittyOS::new();
+        assert_eq!(k.current_thought, "idle");
+        k.set_thought("purr");
+        assert_eq!(k.current_thought, "purr");
+        k.set_thought("invalid");
+        assert_eq!(k.current_thought, "idle");
+    }
+
+    #[test]
+    fn has_eleven_nodes() {
+        assert_eq!(KittyOS::new().nodes().len(), 11);
+    }
+}
+
+#[cfg(test)]
+mod tests_marrow {
+    use super::*;
+
+    #[test]
+    fn life_transitions() {
+        let l = LifeNode::new(true);
+        // Under-population: 1 neighbor -> dies
+        let one: Vec<LifeNode> = vec![LifeNode::new(true)];
+        let ns: Vec<&LifeNode> = one.iter().collect();
+        assert!(!l.next_state(&ns).alive);
+        // Survival: 2 neighbors -> survives
+        let two: Vec<LifeNode> = vec![LifeNode::new(true), LifeNode::new(true)];
+        let ns: Vec<&LifeNode> = two.iter().collect();
+        assert!(l.next_state(&ns).alive);
+    }
+
+    #[test]
+    fn glider_moves() {
+        let m = Marrowweave::new();
+        let alive_before = m
+            .inner
+            .lock()
+            .unwrap()
+            .omni
+            .nodes
+            .values()
+            .filter(|n| n.life.as_ref().map(|l| l.alive).unwrap_or(false))
+            .count();
+        assert!(alive_before >= 5);
+        m.step();
+        let alive_after = m
+            .inner
+            .lock()
+            .unwrap()
+            .omni
+            .nodes
+            .values()
+            .filter(|n| n.life.as_ref().map(|l| l.alive).unwrap_or(false))
+            .count();
+        assert!(alive_after > 0);
+        assert!(m.tick_count() == 1);
+        assert_eq!(m.inner.lock().unwrap().log.len(), 1);
+    }
+
+    #[test]
+    fn nodes_exist_across_realities() {
+        let m = Marrowweave::new();
+        let inner = m.inner.lock().unwrap();
+        assert_eq!(inner.omni.realities.len(), 3);
+        let n = inner.omni.nodes.get("trait_0").unwrap();
+        assert!(n.positions.len() == 3, "expected 3 positions, got {}", n.positions.len());
+        // Glider nodes live only on the grid.
+        let g = inner.omni.nodes.get("glider_0").unwrap();
+        assert_eq!(g.positions.len(), 1);
+    }
+}
