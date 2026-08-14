@@ -1,4 +1,6 @@
 working on currently
+Aurira is not itself a game; it's an  engine for creating and running potentiall self runningy, self maintaining,-
+self-generating/living games.
 /*
   THE_CHOICE_AT_THE_CORE
   Kenji Miyazawa Symbolic OS Game
