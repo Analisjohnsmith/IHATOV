@@ -1,3 +1,5 @@
+i used a game engine and code i haven't looked at in awhile
+
 Yes — **with that clarification, I understand what you're aiming at much better.**
 
 If by “built like *Ihatov/Ihatō Monogatari*” you mean the **game itself is a complete authored world**, rather than a conventional engine demo with a bunch of disconnected systems, then I think your architecture makes considerably more sense.
