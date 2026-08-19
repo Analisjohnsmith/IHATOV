@@ -1,272 +1,727 @@
-.
-bash
-#!/bin/bash
-# generate_ready_to_deploy_platform.sh
-# Creates a complete, production‑ready package of Book OS Engine + Legacy Scroll App
+.# system_utils.py - Mac OS Utilities
+"""
+System 1.0 Utilities in Pure Python
+Based on original Mac ROM routines
+"""
 
-set -e
+import struct
+from datetime import datetime, timedelta
 
-OUTPUT_DIR="legacy_scroll _complete_platform" 
-mkdir -p "$OUTPUT_DIR"
-cd "$OUTPUT_DIR"
+class MacUtils:
+    """System utilities from Mac OS 1.0"""
+    
+    # Mac epoch: January 1, 1904
+    MAC_EPOCH = datetime(1904, 1, 1)
+    
+    @staticmethod
+    def date_to_mac_time(dt):
+        """Convert datetime to Mac OS 32-bit seconds since 1904"""
+        delta = dt - MacUtils.MAC_EPOCH
+        return int(delta.total_seconds())
+    
+    @staticmethod
+    def mac_time_to_date(mac_time):
+        """Convert Mac OS seconds to datetime"""
+        return MacUtils.MAC_EPOCH + timedelta(seconds=mac_time)
+    
+    @staticmethod
+    def pascal_string_to_python(p_string):
+        """Convert Pascal string (length byte + chars) to Python string"""
+        if not p_string:
+            return ""
+        length = p_string[0]
+        return p_string[1:1+length].decode('mac-roman', errors='replace')
+    
+    @staticmethod
+    def python_to_pascal_string(s):
+        """Convert Python string to Pascal string"""
+        encoded = s.encode('mac-roman')[:255]  # Max 255 chars
+        return bytes([len(encoded)]) + encoded
+    
+    @staticmethod
+    def four_char_code(code):
+        """Convert string to OSType (4-char code)"""
+        if isinstance(code, str):
+            return code.ljust(4)[:4].encode('ascii')
+        return code.decode('ascii').strip()
 
-echo "📦 Generating complete platform..."
-
-# ============================================================================
-# 1. BOOK OS ENGINE (Python Flask + API + Web UI)
-# ============================================================================
-mkdir -p book_os_engine/{engine,api,web/templates,web/static,models,data}
-
-cat > book_os_engine/requirements.txt << 'EOF'
-Flask==2.3.3
-Flask-CORS==4.0.0
-flask-limiter==3.3.1
-gunicorn==21.2.0
-markdown==3.5.1
-python-dotenv==1.0.0
-EOF
-
-cat > book_os_engine/engine/books.py << 'EOF'
-BOOKS = {
-    "art_of_war": {"id":"art_of_war","title":"The Art of War","author":"Sun Tzu","year":-500,"domain":"Strategy","core_principle":"Every battle is won before it is fought.","instruction":"Preparation over reaction. Know yourself and your enemy.","quotes":["Every battle is won before it is fought.","Know yourself and know your enemy.","In the midst of chaos, there is also opportunity.","The supreme art of war is to subdue the enemy without fighting."],"teachings":["Preparation wins before engagement","Know your terrain","Find the bottleneck"]},
-    "meditations": {"id":"meditations","title":"Meditations","author":"Marcus Aurelius","year":180,"domain":"Stoicism","core_principle":"You have power over your mind—not outside events.","instruction":"Focus on what you control. Build life action by action.","quotes":["You have power over your mind—not outside events.","Waste no more time arguing what a good man should be. Be one.","The impediment to action advances action.","You must build up your life action by action."],"teachings":["Focus on what you control","Action reveals character","Obstacles become opportunities"]},
-    "enchiridion": {"id":"enchiridion","title":"Enchiridion","author":"Epictetus","year":135,"domain":"Stoicism","core_principle":"Some things are in our control and others not.","instruction":"Sort everything into 'I control' and 'I don't control.' Act accordingly.","quotes":["Some things are in our control and others not.","It's not what happens to you, but how you react that matters.","First say to yourself what you would be; then do what you have to do."],"teachings":["Control what you can","Response over reaction","Become before you speak"]},
-    "tao_te_ching": {"id":"tao_te_ching","title":"Tao Te Ching","author":"Lao Tzu","year":-400,"domain":"Wisdom","core_principle":"The journey of a thousand miles begins with one step.","instruction":"Act without forcing. Nature does not hurry, yet all is accomplished.","quotes":["The journey of a thousand miles begins with one step.","He who knows does not speak; he who speaks does not know.","Water is the softest thing, yet it can penetrate mountains."],"teachings":["Start with one step","Soft strength endures","Patience achieves all"]},
-    "the_prince": {"id":"the_prince","title":"The Prince","author":"Machiavelli","year":1532,"domain":"Leadership","core_principle":"It is much safer to be feared than loved.","instruction":"Be decisive. Choose wisely. Judge by results.","quotes":["It is much safer to be feared than loved.","The wise man does at once what the fool does finally.","The ends justify the means."],"teachings":["Respect over popularity","Decisiveness beats hesitation","Results matter"]},
-    "self_reliance": {"id":"self_reliance","title":"Self-Reliance","author":"Ralph Waldo Emerson","year":1841,"domain":"Identity","core_principle":"Trust thyself.","instruction":"Your judgment matters. Peace comes from within.","quotes":["Trust thyself: every heart vibrates to that iron string.","To be great is to be misunderstood.","Nothing can bring you peace but yourself."],"teachings":["Trust your own judgment","Accept being misunderstood","Peace comes from within"]},
-    "wealth_of_nations": {"id":"wealth_of_nations","title":"The Wealth of Nations","author":"Adam Smith","year":1776,"domain":"Business","core_principle":"The division of labor is the great cause of the increase of work.","instruction":"Specialize. Trade. Focus on what you do best.","quotes":["It is not from the benevolence of the butcher that we expect our dinner.","The division of labor is the great cause of the increase of work."],"teachings":["Specialization multiplies output","Focus on the end user","Create real value"]},
-    "how_to_live": {"id":"how_to_live","title":"How to Live on 24 Hours a Day","author":"Arnold Bennett","year":1910,"domain":"Productivity","core_principle":"You have to live on twenty-four hours of daily time.","instruction":"Guard your time. Cultivate your mind. Use today's time today.","quotes":["The chief beauty about time is that you cannot waste it in advance.","You have to live on twenty-four hours of daily time.","Time is the only capital you have."],"teachings":["Use today's time today","Guard your hours","Time is your only asset"]}
-}
-def get_book(book_id): return BOOKS.get(book_id)
-def get_all_books(): return BOOKS
-EOF
-
-cat > book_os_engine/engine/core.py << 'EOF'
-from datetime import date, timedelta
-from .books import get_book
-
-BUSINESS_CONCEPTS = {"Fundamental":[{"name":"Output vs Outcome","explanation":"You control effort, not results.","source":"Wattles"}],"Intermediate":[{"name":"Throughput","explanation":"Flow matters more than activity.","source":"Wattles"}],"Advanced":[{"name":"Leverage","explanation":"Results divided by effort.","source":"Musashi"}]}
-COMMANDS = {"Awareness":["See clearly."],"Control":["Choose deliberately."],"Identity":["Act as who you are becoming."],"Strategy":["Prepare before acting."],"Advanced":["Leverage your strengths."]}
-REPS = ["One deliberate action.","One moment of awareness.","One small step toward your goal."]
-SUBTLE = {"Fundamental":"This principle compounds with repetition.","Intermediate":"Notice how this connects to previous concepts.","Advanced":"Leverage compounds exponentially."}
-
-def get_layer(day, dpl=18):
-    if day <= dpl: return "Awareness"
-    if day <= dpl*2: return "Control"
-    if day <= dpl*3: return "Identity"
-    if day <= dpl*4: return "Strategy"
-    return "Advanced"
-
-def get_business(week):
-    if week < 4: return BUSINESS_CONCEPTS["Fundamental"][0]
-    if week < 8: return BUSINESS_CONCEPTS["Intermediate"][0]
-    return BUSINESS_CONCEPTS["Advanced"][0]
-
-def generate_curriculum(book_ids, days_per_layer=18):
-    books = [get_book(bid) for bid in book_ids if get_book(bid)]
-    all_quotes = [(b, q) for b in books for q in b.get("quotes",[])]
-    if not all_quotes: raise ValueError("No quotes found")
-    total_days = days_per_layer * 5
-    scrolls = []
-    for day in range(1, total_days+1):
-        book, quote = all_quotes[(day-1) % len(all_quotes)]
-        layer = get_layer(day, days_per_layer)
-        week = (day-1)//7
-        biz = get_business(week)
-        scrolls.append({
-            "id": day,
-            "date": (date(2026,1,1)+timedelta(days=day-1)).isoformat(),
-            "layer": layer,
-            "source": book["title"],
-            "author": book["author"],
-            "year": book["year"],
-            "quote": quote,
-            "core_principle": book.get("core_principle",""),
-            "instruction": book.get("instruction",""),
-            "teaching": book["teachings"][day % len(book["teachings"])],
-            "context": f"From {book['title']} by {book['author']}: {book.get('instruction','')}",
-            "contemplation": f"How does {book['author']}'s teaching apply today?",
-            "business_concept": biz["name"],
-            "business_explanation": biz["explanation"],
-            "business_source": biz["source"],
-            "command": COMMANDS[layer][0],
-            "rep": REPS[day % len(REPS)],
-            "subtle_layer": SUBTLE[biz["name"] in ["Throughput","Margins"] and "Intermediate" or (biz["name"] in ["Leverage","Equity"] and "Advanced" or "Fundamental")],
-            "category_tags": [layer, book["domain"]]
-        })
-    return {"metadata": {"total_days": total_days, "books_used": [b["title"] for b in books]}, "scrolls": scrolls}
-EOF
-
-cat > book_os_engine/app.py << 'EOF'
-from flask import Flask, request, jsonify, render_template
-from flask_cors import CORS
-from engine.books import get_all_books, get_book
-from engine.core import generate_curriculum
-import json
-app = Flask(__name__, template_folder="web/templates", static_folder="web/static")
-CORS(app)
-
-@app.route("/")
-def index(): return render_template("index.html", books=get_all_books())
-@app.route("/api/books")
-def api_books(): return jsonify(get_all_books())
-@app.route("/api/generate", methods=["POST"])
-def api_generate():
-    data = request.json
-    book_ids = data.get("book_ids", [])
-    if not book_ids: return jsonify({"error":"No books selected"}),400
-    days = data.get("days_per_layer", 18)
-    try:
-        curriculum = generate_curriculum(book_ids, days)
-        return jsonify({"success":True, "curriculum":curriculum})
-    except Exception as e: return jsonify({"error":str(e)}),500
-@app.route("/api/export", methods=["POST"])
-def api_export():
-    data = request.json
-    book_ids = data.get("book_ids", [])
-    days = data.get("days_per_layer", 18)
-    curriculum = generate_curriculum(book_ids, days)
-    response = app.response_class(response=json.dumps(curriculum, indent=2), mimetype="application/json")
-    response.headers["Content-Disposition"] = "attachment; filename=scrolls.json"
-    return response
+# Test it
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True)
-EOF
+    # Test date conversion
+    now = datetime.now()
+    mac_time = MacUtils.date_to_mac_time(now)
+    back_to_date = MacUtils.mac_time_to_date(mac_time)
+    print(f"Now: {now}")
+    print(f"Mac time: {mac_time}")
+    print(f"Converted back: {back_to_date}")
+    
+    # Test Pascal strings
+    p_str = MacUtils.python_to_pascal_string("Hello Mac")
+    print(f"Pascal string: {p_str}")
+    print(f"Back to Python: {MacUtils.pascal_string_to_python(p_str)}") macos-python/
+├── system_utils.py     # ✅ We just made this
+├── memory_manager.py   # Next
+├── quickdraw.py        # Then this
+├── event_manager.py    # And so on...
+├── window_manager.py
+├── file_manager.py
+├── resource_manager.py
+├── finder.py
+└── main.py            # Boot loader """
+QuickDraw Graphics Engine
+Classic Mac OS System 1.0 - Pure Python Implementation
+Based on Inside Macintosh Volume I
+"""
 
-mkdir -p book_os_engine/web/templates
-cat > book_os_engine/web/templates/index.html << 'EOF'
-<!DOCTYPE html>
-<html><head><title>Book OS Engine</title><style>body{font-family:Georgia;background:#0a0c0f;color:#e8e6e3;padding:20px}h1{color:#b87c4f}.grid{display:grid;grid-template-columns:300px 1fr;gap:20px}.panel{background:#14171c;padding:20px;border-radius:12px}.book-card{background:#1e2228;padding:8px;margin:4px;border-radius:8px;cursor:pointer}.book-card.selected{background:#b87c4f;color:#0a0c0f}button{background:#b87c4f;color:#0a0c0f;padding:10px;border:none;border-radius:8px;cursor:pointer;width:100%}</style></head>
-<body><h1>📚 Book OS Engine</h1><div class="grid"><div class="panel"><h2>Select Books</h2><div id="bookList"></div><label>Days per layer:</label><input type="number" id="days" value="18"><button id="generateBtn">Generate Curriculum</button></div><div class="panel"><h2>Preview</h2><div id="preview"></div><button id="exportBtn">Export JSON</button></div></div>
-<script>let selected=[],curriculum=null;
-fetch('/api/books').then(r=>r.json()).then(books=>{let container=document.getElementById('bookList');Object.keys(books).forEach(id=>{let d=document.createElement('div');d.className='book-card';d.innerText=books[id].title;d.onclick=()=>{if(selected.includes(id))selected=selected.filter(i=>i!==id);else selected.push(id);d.classList.toggle('selected')};container.appendChild(d)})});
-document.getElementById('generateBtn').onclick=async()=>{let res=await fetch('/api/generate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({book_ids:selected,days_per_layer:parseInt(document.getElementById('days').value)})});let data=await res.json();if(data.success){curriculum=data.curriculum;document.getElementById('preview').innerHTML=curriculum.scrolls.slice(0,10).map(s=>`<div><b>Day ${s.id}: ${s.layer}</b><br>${s.quote.substring(0,100)}...<br><i>${s.command}</i></div>`).join('')}};
-document.getElementById('exportBtn').onclick=async()=>{if(!curriculum)return;let res=await fetch('/api/export',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({book_ids:selected,days_per_layer:parseInt(document.getElementById('days').value)})});let blob=await res.blob();let a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='scrolls.json';a.click()};
-</script></body></html>
-EOF
+import tkinter as tk
+from PIL import Image, ImageDraw, ImageFont
+import struct
+import math
 
-# ============================================================================
-# 2. LEGACY SCROLL APP (React Native / Expo)
-# ============================================================================
-npx create-expo-app legacy-scroll-app --template blank-typescript --no-install
-cd legacy-scroll-app
-cat > package.json << 'EOF'
-{
-  "name": "legacy-scroll",
-  "version": "1.0.0",
-  "main": "index.js",
-  "scripts": {"start":"expo start","android":"expo start --android","ios":"expo start --ios"},
-  "dependencies": {
-    "expo":"~51.0.0","expo-status-bar":"~1.12.0","react":"18.2.0","react-native":"0.74.0",
-    "expo-sqlite":"~14.0.0","@react-native-async-storage/async-storage":"1.23.0",
-    "zustand":"4.5.0","@react-navigation/native":"6.1.10","@react-navigation/native-stack":"6.9.18",
-    "react-native-screens":"3.31.0","react-native-safe-area-context":"4.10.0",
-    "native-base":"3.4.28","react-native-svg":"15.2.0","@expo/vector-icons":"14.0.0"
-  }
-}
-EOF
-mkdir -p src/data
-echo '{"metadata":{"total_days":90},"scrolls":[]}' > src/data/scrolls.json
-mkdir -p src/store
-cat > src/store/scrollStore.ts << 'EOF'
-import { create } from 'zustand';
-import { persist, createJSONStorage } from 'zustand/middleware';
-import AsyncStorage from '@react-native-async-storage/async-storage';
-export interface Scroll { id: number; date: string; layer: string; source: string; author: string; quote: string; command: string; rep: string; }
-interface ScrollState { scrolls: Scroll[]; progress: { completedIds: number[]; notes: Record<number,string> }; loadScrolls: () => Promise<void>; getToday: () => Scroll | null; complete: (id: number, note?: string) => void; isCompleted: (id: number) => boolean; getStats: () => { completed: number; total: number; percentage: number }; }
-export const useScrollStore = create<ScrollState>()(persist((set,get) => ({ scrolls: [], progress: { completedIds: [], notes: {} }, loadScrolls: async () => { try { const data = await import('../data/scrolls.json'); set({ scrolls: data.scrolls }); } catch(e) {} }, getToday: () => { const today = new Date().toISOString().split('T')[0]; return get().scrolls.find(s => s.date === today) || null; }, complete: (id,note) => { const { progress } = get(); if (!progress.completedIds.includes(id)) { const newNotes = { ...progress.notes }; if (note) newNotes[id] = note; set({ progress: { completedIds: [...progress.completedIds, id], notes: newNotes } }); } }, isCompleted: (id) => get().progress.completedIds.includes(id), getStats: () => { const { scrolls, progress } = get(); return { completed: progress.completedIds.length, total: scrolls.length, percentage: scrolls.length ? (progress.completedIds.length / scrolls.length) * 100 : 0 }; } }), { name: 'legacy-scroll-storage', storage: createJSONStorage(() => AsyncStorage), partialize: (state) => ({ progress: state.progress }) }));
-EOF
-mkdir -p src/screens
-cat > src/App.tsx << 'EOF'
-import React, { useEffect, useState } from 'react';
-import { NavigationContainer } from '@react-navigation/native';
-import { createNativeStackNavigator } from '@react-navigation/native-stack';
-import { NativeBaseProvider, extendTheme, Box, Text, Pressable, ScrollView, HStack, Badge, Heading, Divider, IconButton } from 'native-base';
-import { StatusBar } from 'expo-status-bar';
-import { Ionicons } from '@expo/vector-icons';
-import { useScrollStore } from './store/scrollStore';
-const theme = extendTheme({ colors: { primary: { 500: '#b87c4f' }, background: { 800: '#14171c', 900: '#0a0c0f' }, text: { primary: '#e8e6e3', secondary: '#bbb8b2' } }, config: { initialColorMode: 'dark' } });
-const Stack = createNativeStackNavigator();
-const HomeScreen = ({ navigation }: any) => {
-  const { getToday, complete, isCompleted, loadScrolls, scrolls } = useScrollStore();
-  const [today, setToday] = useState<any>(null);
-  useEffect(() => { loadScrolls(); }, []);
-  useEffect(() => { if (scrolls.length) setToday(getToday()); }, [scrolls]);
-  if (!today) return <Box flex={1} justifyContent="center" alignItems="center" bg="background.800"><Text color="primary.500">Loading...</Text></Box>;
-  const completed = isCompleted(today.id);
-  return (<ScrollView bg="background.800" contentContainerStyle={{ padding: 24 }}>
-    <HStack justifyContent="space-between" mb={6}><Heading color="primary.500" size="lg">Legacy Scroll</Heading><HStack space={3}><IconButton icon={<Ionicons name="calendar-outline" size={24} color="#b87c4f" />} onPress={() => navigation.navigate('Archive')} /><IconButton icon={<Ionicons name="stats-chart-outline" size={24} color="#b87c4f" />} onPress={() => navigation.navigate('Stats')} /></HStack></HStack>
-    <Box borderLeftWidth={3} borderLeftColor="primary.500" pl={4} mb={6}><Text color="primary.500" fontSize="xs">{today.source}</Text><Text color="text.primary" fontSize="2xl" fontStyle="italic">"{today.quote}"</Text><Text color="primary.500" fontSize="sm">— {today.author}</Text></Box>
-    <Box bg="primary.900" p={5} borderRadius="lg" mb={6}><Text color="primary.500" fontSize="lg" fontWeight="bold" textAlign="center">{today.command}</Text><Divider bg="primary.800" my={3} /><Text color="text.muted" textAlign="center">Rep: {today.rep}</Text></Box>
-    {!completed ? <Pressable onPress={() => complete(today.id)} bg="primary.500" p={4} borderRadius="lg" alignItems="center"><Text color="background.900" fontWeight="bold">Mark Complete</Text></Pressable> : <Text color="green.500" textAlign="center">✓ Completed</Text>}
-  </ScrollView>);
-};
-const ArchiveScreen = () => { const { scrolls, isCompleted } = useScrollStore(); return (<ScrollView bg="background.800" p={4}>{scrolls.map(s=><HStack key={s.id} justifyContent="space-between" py={2} borderBottomWidth={1}><Text color={isCompleted(s.id)?'green.500':'text.secondary'}>Day {s.id}</Text><Text color="text.muted" fontSize="sm">{s.command}</Text>{isCompleted(s.id)&&<Ionicons name="checkmark-circle" size={16} color="#2e7d64" />}</HStack>)}</ScrollView>); };
-const StatsScreen = () => { const { getStats } = useScrollStore(); const stats = getStats(); return (<ScrollView bg="background.800" p={5}><Box bg="background.700" p={5} borderRadius="lg"><Heading size="lg" color="primary.500" textAlign="center">{stats.completed}/{stats.total}</Heading><Text textAlign="center">Completions</Text><Box mt={3} h={4} bg="background.600" borderRadius="full"><Box w={`${stats.percentage}%`} h="full" bg="primary.500" /></Box></Box></ScrollView>); };
-export default function App() { const { loadScrolls } = useScrollStore(); useEffect(() => { loadScrolls(); }, []); return (<NativeBaseProvider theme={theme}><StatusBar style="light" /><NavigationContainer><Stack.Navigator screenOptions={{ headerShown: false }}><Stack.Screen name="Home" component={HomeScreen} /><Stack.Screen name="Archive" component={ArchiveScreen} options={{ headerShown: true, title: 'Archive' }} /><Stack.Screen name="Stats" component={StatsScreen} options={{ headerShown: true, title: 'Progress' }} /></Stack.Navigator></NavigationContainer></NativeBaseProvider>); }
-EOF
-cat > index.tsx << 'EOF'
-import { registerRootComponent } from 'expo';
-import App from './src/App';
-registerRootComponent(App);
-EOF
-cd ..
+class QuickDraw:
+    """
+    Complete QuickDraw implementation
+    Supports both 512x342 (original Mac) and custom sizes
+    """
+    
+    # QuickDraw GrafPort modes
+    MODES = {
+        'srcCopy': 0,      # Source copy
+        'srcOr': 1,        # Source OR
+        'srcXor': 2,       # Source XOR  
+        'srcBic': 3,       # Source BIC
+        'notSrcCopy': 4,   # NOT source copy
+        'notSrcOr': 5,     # NOT source OR
+        'notSrcXor': 6,    # NOT source XOR
+        'notSrcBic': 7,    # NOT source BIC
+        'patCopy': 8,      # Pattern copy
+        'patOr': 9,        # Pattern OR
+        'patXor': 10,      # Pattern XOR
+        'patBic': 11,      # Pattern BIC
+        'notPatCopy': 12,  # NOT pattern copy
+        'notPatOr': 13,    # NOT pattern OR
+        'notPatXor': 14,   # NOT pattern XOR
+        'notPatBic': 15,   # NOT pattern BIC
+    }
+    
+    # Standard Mac patterns
+    PATTERNS = {
+        'black': [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF],
+        'white': [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
+        'gray':  [0xAA, 0x55, 0xAA, 0x55, 0xAA, 0x55, 0xAA, 0x55],
+        'ltGray': [0xCC, 0x33, 0xCC, 0x33, 0xCC, 0x33, 0xCC, 0x33],
+        'dkGray': [0x88, 0x22, 0x88, 0x22, 0x88, 0x22, 0x88, 0x22],
+    }
+    
+    def __init__(self, width=512, height=342):
+        """Initialize QuickDraw with given dimensions"""
+        self.width = width
+        self.height = height
+        
+        # The drawing canvas (1-bit black/white)
+        self.canvas = bytearray((width * height) // 8)
+        
+        # Current graphics port (GrafPort)
+        self.port = {
+            'pen': {
+                'location': (0, 0),
+                'size': (1, 1),
+                'mode': 'patCopy',
+                'pattern': self.PATTERNS['black'],
+            },
+            'fore_color': 0,  # 0 = black, 1 = white
+            'back_color': 1,
+            'text': {
+                'font': 'Chicago',
+                'size': 12,
+                'face': 0,  # 0=plain, 1=bold, 2=italic, 4=underline
+                'mode': 'srcOr',
+            },
+            'origin': (0, 0),
+            'clip_rect': (0, 0, width, height),
+            'visible': True,
+        }
+        
+        # For display
+        self.root = None
+        self.canvas_widget = None
+        self.need_update = True
+        
+    # ========== COORDINATE FUNCTIONS ==========
+    
+    def MoveTo(self, h, v):
+        """Move pen to absolute coordinates"""
+        self.port['pen']['location'] = (h, v)
+        
+    def Move(self, dh, dv):
+        """Move pen relative to current position"""
+        h, v = self.port['pen']['location']
+        self.port['pen']['location'] = (h + dh, v + dv)
+        
+    def GetPen(self):
+        """Get current pen location"""
+        return self.port['pen']['location']
+    
+    def SetOrigin(self, h, v):
+        """Set global origin offset"""
+        self.port['origin'] = (h, v)
+        
+    def SetClip(self, rect):
+        """Set clipping rectangle (left, top, right, bottom)"""
+        self.port['clip_rect'] = rect
+        
+    # ========== PEN FUNCTIONS ==========
+    
+    def PenSize(self, width, height):
+        """Set pen size"""
+        self.port['pen']['size'] = (width, height)
+        
+    def PenMode(self, mode):
+        """Set pen drawing mode"""
+        if mode in self.MODES:
+            self.port['pen']['mode'] = mode
+            
+    def PenPat(self, pattern):
+        """Set pen pattern (8 bytes defining 8x8 pattern)"""
+        if len(pattern) == 8:
+            self.port['pen']['pattern'] = list(pattern)
+            
+    def PenNormal(self):
+        """Reset pen to default state"""
+        self.port['pen']['size'] = (1, 1)
+        self.port['pen']['mode'] = 'patCopy'
+        self.port['pen']['pattern'] = self.PATTERNS['black']
+        
+    # ========== DRAWING FUNCTIONS ==========
+    
+    def PaintRect(self, rect):
+        """Paint a rectangle with current pen pattern"""
+        left, top, right, bottom = rect
+        self._draw_rect(left, top, right, bottom, fill=True)
+        
+    def FrameRect(self, rect):
+        """Draw outline of rectangle"""
+        left, top, right, bottom = rect
+        pen_w, pen_h = self.port['pen']['size']
+        
+        # Top line
+        self._draw_line(left, top, right, top, pen_h)
+        # Bottom line
+        self._draw_line(left, bottom - pen_h, right, bottom - pen_h, pen_h)
+        # Left line
+        self._draw_line(left, top, left, bottom, pen_w)
+        # Right line
+        self._draw_line(right - pen_w, top, right - pen_w, bottom, pen_w)
+        
+    def PaintOval(self, rect):
+        """Paint an oval inside rectangle"""
+        left, top, right, bottom = rect
+        self._draw_oval(left, top, right, bottom, fill=True)
+        
+    def FrameOval(self, rect):
+        """Draw outline of oval"""
+        left, top, right, bottom = rect
+        self._draw_oval(left, top, right, bottom, fill=False)
+        
+    def PaintRoundRect(self, rect, oval_width, oval_height):
+        """Paint rounded rectangle"""
+        left, top, right, bottom = rect
+        self._draw_round_rect(left, top, right, bottom, 
+                             oval_width, oval_height, fill=True)
+        
+    def FrameRoundRect(self, rect, oval_width, oval_height):
+        """Draw outline of rounded rectangle"""
+        left, top, right, bottom = rect
+        self._draw_round_rect(left, top, right, bottom, 
+                             oval_width, oval_height, fill=False)
+        
+    def PaintArc(self, rect, start_angle, arc_angle):
+        """Paint a wedge (pie slice)"""
+        left, top, right, bottom = rect
+        self._draw_arc(left, top, right, bottom, 
+                      start_angle, arc_angle, fill=True)
+        
+    def FrameArc(self, rect, start_angle, arc_angle):
+        """Draw outline of arc"""
+        left, top, right, bottom = rect
+        self._draw_arc(left, top, right, bottom, 
+                      start_angle, arc_angle, fill=False)
+        
+    def PaintPolygon(self, points):
+        """Paint a polygon"""
+        self._draw_polygon(points, fill=True)
+        
+    def FramePolygon(self, points):
+        """Draw outline of polygon"""
+        self._draw_polygon(points, fill=False)
+        
+    def LineTo(self, h, v):
+        """Draw line from current pen to specified point"""
+        start_h, start_v = self.port['pen']['location']
+        self._draw_line(start_h, start_v, h, v)
+        self.port['pen']['location'] = (h, v)
+        
+    def Line(self, dh, dv):
+        """Draw line relative from current pen"""
+        start_h, start_v = self.port['pen']['location']
+        end_h, end_v = start_h + dh, start_v + dv
+        self._draw_line(start_h, start_v, end_h, end_v)
+        self.port['pen']['location'] = (end_h, end_v)
+        
+    # ========== TEXT FUNCTIONS ==========
+    
+    def TextFont(self, font_num):
+        """Set text font by ID (0-3 = system fonts)"""
+        fonts = ['Chicago', 'Geneva', 'Monaco', 'New York']
+        if 0 <= font_num < len(fonts):
+            self.port['text']['font'] = fonts[font_num]
+            
+    def TextSize(self, size):
+        """Set text size"""
+        self.port['text']['size'] = size
+        
+    def TextFace(self, style):
+        """Set text style (0=plain,1=bold,2=italic,4=underline)"""
+        self.port['text']['face'] = style
+        
+    def TextMode(self, mode):
+        """Set text drawing mode"""
+        if mode in self.MODES:
+            self.port['text']['mode'] = mode
+            
+    def DrawChar(self, char):
+        """Draw a single character at pen location"""
+        h, v = self.port['pen']['location']
+        self._draw_text(char, h, v)
+        # Advance pen (monospaced for simplicity)
+        self.Move(self.port['text']['size'] // 2, 0)
+        
+    def DrawString(self, text):
+        """Draw a Pascal string at pen location"""
+        if isinstance(text, bytes):
+            # Pascal string
+            length = text[0]
+            text = text[1:1+length].decode('mac-roman')
+        self._draw_text(text, *self.port['pen']['location'])
+        # Advance pen
+        self.Move(len(text) * self.port['text']['size'] // 2, 0)
+        
+    def DrawText(self, text, count):
+        """Draw first 'count' characters of text"""
+        self.DrawString(text[:count])
+        
+    # ========== BITMAP FUNCTIONS ==========
+    
+    def CopyBits(self, src_bounds, dst_bounds, mode):
+        """Copy bits from source to destination"""
+        # Simplified implementation
+        pass
+        
+    def ScrollRect(self, rect, dh, dv):
+        """Scroll contents of rectangle"""
+        # Simplified implementation
+        pass
+        
+    # ========== PRIVATE DRAWING METHODS ==========
+    
+    def _set_pixel(self, x, y, color):
+        """Set pixel at (x,y) to color (0=black, 1=white)"""
+        if x < 0 or x >= self.width or y < 0 or y >= self.height:
+            return
+        # Check clip rect
+        l,t,r,b = self.port['clip_rect']
+        if x < l or x >= r or y < t or y >= b:
+            return
+            
+        # Convert to byte index and bit
+        byte_idx = (y * self.width + x) // 8
+        bit_idx = 7 - ((y * self.width + x) % 8)
+        
+        if color == 0:  # black
+            self.canvas[byte_idx] |= (1 << bit_idx)
+        else:  # white
+            self.canvas[byte_idx] &= ~(1 << bit_idx)
+            
+    def _get_pixel(self, x, y):
+        """Get pixel color at (x,y)"""
+        if x < 0 or x >= self.width or y < 0 or y >= self.height:
+            return 1  # white
+        byte_idx = (y * self.width + x) // 8
+        bit_idx = 7 - ((y * self.width + x) % 8)
+        return (self.canvas[byte_idx] >> bit_idx) & 1
+        
+    def _draw_line(self, x1, y1, x2, y2, thickness=1):
+        """Bresenham line algorithm"""
+        dx = abs(x2 - x1)
+        dy = abs(y2 - y1)
+        sx = 1 if x1 < x2 else -1
+        sy = 1 if y1 < y2 else -1
+        err = dx - dy
+        
+        while True:
+            # Draw thickness
+            for tx in range(thickness):
+                for ty in range(thickness):
+                    self._set_pixel(x1 + tx, y1 + ty, self.port['fore_color'])
+                    
+            if x1 == x2 and y1 == y2:
+                break
+                
+            e2 = 2 * err
+            if e2 > -dy:
+                err -= dy
+                x1 += sx
+            if e2 < dx:
+                err += dx
+                y1 += sy
+                
+    def _draw_rect(self, left, top, right, bottom, fill=True):
+        """Draw or fill rectangle"""
+        for y in range(top, bottom):
+            for x in range(left, right):
+                if fill:
+                    self._set_pixel(x, y, self.port['fore_color'])
+                else:
+                    # Just outline
+                    if (x == left or x == right-1 or 
+                        y == top or y == bottom-1):
+                        self._set_pixel(x, y, self.port['fore_color'])
+                        
+    def _draw_oval(self, left, top, right, bottom, fill=True):
+        """Draw or fill oval"""
+        # Center and radii
+        cx = (left + right) / 2
+        cy = (top + bottom) / 2
+        rx = (right - left) / 2
+        ry = (bottom - top) / 2
+        
+        for y in range(top, bottom):
+            for x in range(left, right):
+                # Ellipse equation
+                if ((x - cx) / rx) ** 2 + ((y - cy) / ry) ** 2 <= 1:
+                    if fill:
+                        self._set_pixel(x, y, self.port['fore_color'])
+                    else:
+                        # Only draw border (check if on edge)
+                        dist = ((x - cx) / rx) ** 2 + ((y - cy) / ry) ** 2
+                        if 0.9 <= dist <= 1.1:
+                            self._set_pixel(x, y, self.port['fore_color'])
+                            
+    def _draw_round_rect(self, left, top, right, bottom, 
+                        oval_w, oval_h, fill=True):
+        """Draw or fill rounded rectangle"""
+        radius = min(oval_w, oval_h) // 2
+        
+        for y in range(top, bottom):
+            for x in range(left, right):
+                # Check if in corners
+                if x < left + radius and y < top + radius:
+                    # Top-left corner
+                    if ((x - (left + radius)) ** 2 + 
+                        (y - (top + radius)) ** 2 <= radius ** 2):
+                        if fill:
+                            self._set_pixel(x, y, self.port['fore_color'])
+                elif x > right - radius and y < top + radius:
+                    # Top-right corner
+                    if ((x - (right - radius)) ** 2 + 
+                        (y - (top + radius)) ** 2 <= radius ** 2):
+                        if fill:
+                            self._set_pixel(x, y, self.port['fore_color'])
+                elif x < left + radius and y > bottom - radius:
+                    # Bottom-left corner
+                    if ((x - (left + radius)) ** 2 + 
+                        (y - (bottom - radius)) ** 2 <= radius ** 2):
+                        if fill:
+                            self._set_pixel(x, y, self.port['fore_color'])
+                elif x > right - radius and y > bottom - radius:
+                    # Bottom-right corner
+                    if ((x - (right - radius)) ** 2 + 
+                        (y - (bottom - radius)) ** 2 <= radius ** 2):
+                        if fill:
+                            self._set_pixel(x, y, self.port['fore_color'])
+                else:
+                    # Main rectangle
+                    if fill:
+                        self._set_pixel(x, y, self.port['fore_color'])
+                    elif (x == left or x == right-1 or 
+                          y == top or y == bottom-1):
+                        self._set_pixel(x, y, self.port['fore_color'])
+                        
+    def _draw_text(self, text, x, y):
+        """Draw text using built-in font simulation"""
+        # Simple monospaced rendering
+        for i, char in enumerate(str(text)):
+            # Draw character as 5x7 dot matrix (simple)
+            if char == 'A':
+                pattern = [0x3E, 0x51, 0x49, 0x45, 0x3E]  # Simple A
+            elif char == 'B':
+                pattern = [0x7F, 0x49, 0x49, 0x49, 0x36]  # Simple B
+            else:
+                pattern = [0x00, 0x00, 0x00, 0x00, 0x00]  # Space
+                
+            # Render pattern
+            for row, bits in enumerate(pattern):
+                for col in range(5):
+                    if bits & (1 << (7-col)):
+                        self._set_pixel(x + i*8 + col, y + row, 
+                                      self.port['fore_color'])
+                        
+    def _draw_arc(self, left, top, right, bottom, 
+                  start_angle, arc_angle, fill=True):
+        """Draw or fill arc/pie wedge"""
+        cx = (left + right) / 2
+        cy = (top + bottom) / 2
+        rx = (right - left) / 2
+        ry = (bottom - top) / 2
+        
+        start_rad = math.radians(start_angle)
+        end_rad = math.radians(start_angle + arc_angle)
+        
+        for y in range(top, bottom):
+            for x in range(left, right):
+                # Convert to polar coordinates
+                dx = x - cx
+                dy = y - cy
+                
+                # Normalize to ellipse
+                nx = dx / rx if rx != 0 else 0
+                ny = dy / ry if ry != 0 else 0
+                
+                # Check if inside ellipse
+                if nx*nx + ny*ny <= 1:
+                    # Check angle
+                    angle = math.atan2(dy, dx)
+                    if angle < 0:
+                        angle += 2 * math.pi
+                        
+                    if start_angle <= math.degrees(angle) <= start_angle + arc_angle:
+                        if fill:
+                            self._set_pixel(x, y, self.port['fore_color'])
+                        else:
+                            # Border only
+                            if 0.9 <= nx*nx + ny*ny <= 1.1:
+                                self._set_pixel(x, y, self.port['fore_color'])
+                                
+    def _draw_polygon(self, points, fill=True):
+        """Draw or fill polygon"""
+        if len(points) < 3:
+            return
+            
+        # Find bounds
+        min_x = min(p[0] for p in points)
+        max_x = max(p[0] for p in points)
+        min_y = min(p[1] for p in points)
+        max_y = max(p[1] for p in points)
+        
+        # Scanline fill
+        for y in range(min_y, max_y + 1):
+            intersections = []
+            
+            # Find intersections with polygon edges
+            for i in range(len(points)):
+                p1 = points[i]
+                p2 = points[(i+1) % len(points)]
+                
+                # Check if edge crosses scanline
+                if (p1[1] <= y < p2[1]) or (p2[1] <= y < p1[1]):
+                    # Linear interpolation
+                    x = p1[0] + (y - p1[1]) * (p2[0] - p1[0]) / (p2[1] - p1[1])
+                    intersections.append(int(x))
+                    
+            intersections.sort()
+            
+            # Fill between pairs
+            for i in range(0, len(intersections), 2):
+                if i + 1 < len(intersections):
+                    for x in range(intersections[i], intersections[i+1] + 1):
+                        self._set_pixel(x, y, self.port['fore_color'])
+                        
+    # ========== DISPLAY FUNCTIONS ==========
+    
+    def show(self):
+        """Display the QuickDraw canvas in a window"""
+        if self.root is None:
+            self.root = tk.Tk()
+            self.root.title("QuickDraw - Classic Mac Graphics")
+            
+            # Create canvas for display
+            self.canvas_widget = tk.Canvas(
+                self.root, 
+                width=self.width, 
+                height=self.height,
+                bg='white'
+            )
+            self.canvas_widget.pack()
+            
+            # Add menu bar
+            menubar = tk.Menu(self.root)
+            self.root.config(menu=menubar)
+            
+            file_menu = tk.Menu(menubar)
+            menubar.add_cascade(label="File", menu=file_menu)
+            file_menu.add_command(label="Save as PICT", command=self.save_as_pict)
+            file_menu.add_command(label="Clear", command=self.clear)
+            file_menu.add_separator()
+            file_menu.add_command(label="Quit", command=self.root.quit)
+            
+            edit_menu = tk.Menu(menubar)
+            menubar.add_cascade(label="Edit", menu=edit_menu)
+            edit_menu.add_command(label="Copy", command=self.copy)
+            
+            # Update display
+            self.update_display()
+            
+        self.root.mainloop()
+        
+    def update_display(self):
+        """Update the display canvas"""
+        if self.canvas_widget:
+            # Convert bytearray to image
+            img = Image.new('1', (self.width, self.height))
+            pixels = img.load()
+            
+            for y in range(self.height):
+                for x in range(self.width):
+                    pixels[x, y] = self._get_pixel(x, y)
+                    
+            # Convert to PhotoImage
+            self.photo = ImageTk.PhotoImage(img)
+            self.canvas_widget.create_image(0, 0, image=self.photo, anchor='nw')
+            
+    def clear(self):
+        """Clear canvas to white"""
+        self.canvas = bytearray((self.width * self.height) // 8)
+        self.update_display()
+        
+    def save_as_pict(self):
+        """Save as PICT format"""
+        filename = f"quickdraw_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pict"
+        # Simplified - just save as raw
+        with open(filename, 'wb') as f:
+            f.write(self.canvas)
+        print(f"Saved to {filename}")
+        
+    def copy(self):
+        """Copy to clipboard (simplified)"""
+        print("Copy to clipboard - not implemented")
+        
+    # ========== TEST FUNCTIONS ==========
+    
+    def test_pattern(self):
+        """Draw the classic Mac test pattern"""
+        self.clear()
+        
+        # Draw gray bars
+        self.port['fore_color'] = 0
+        self.PaintRect((0, 0, 512, 50))
+        
+        self.port['fore_color'] = 1
+        self.PaintRect((0, 50, 512, 100))
+        
+        # Draw circles
+        self.port['fore_color'] = 0
+        self.FrameOval((100, 150, 200, 250))
+        self.PaintOval((250, 150, 350, 250))
+        
+        # Draw text
+        self.MoveTo(100, 300)
+        self.DrawString("Hello Macintosh!")
+        
+        # Draw lines
+        self.MoveTo(50, 320)
+        self.LineTo(450, 320)
+        self.PenSize(3, 3)
+        self.MoveTo(50, 330)
+        self.LineTo(450, 330)
+        
+        # Draw patterns
+        self.PenPat(self.PATTERNS['gray'])
+        self.PaintRect((50, 350, 150, 400))
+        
+        self.PenPat(self.PATTERNS['ltGray'])
+        self.PaintRect((200, 350, 300, 400))
+        
+        self.PenPat(self.PATTERNS['dkGray'])
+        self.PaintRect((350, 350, 450, 400))
+        
+        self.update_display()
 
-# ============================================================================
-# 3. LICENSE & DOCUMENTATION
-# ============================================================================
-cat > LICENSE.txt << 'EOF'
-Non-Exclusive Commercial License
+# ========== QUICKDRAW COMPATIBILITY LAYER ==========
 
-This software is licensed, not sold. Licensee pays a one-time fee of $25,000 for a non-exclusive, perpetual license to use, modify, and distribute the software.
+class GrafPort:
+    """QuickDraw GrafPort object"""
+    def __init__(self, qd):
+        self.qd = qd
+        self.port = qd.port
+        
+    def SetPort(self):
+        """Make this the current graphics port"""
+        # In single-port system, just reference
+        pass
 
-Permitted: Use in commercial products, create derivative works, distribute compiled versions.
-Prohibited: Sublicensing the source code as a competing engine, claiming exclusive rights.
+class BitMap:
+    """QuickDraw BitMap structure"""
+    def __init__(self, base_addr, row_bytes, bounds):
+        self.baseAddr = base_addr
+        self.rowBytes = row_bytes
+        self.bounds = bounds
 
-For multiple licenses or white-label rights, contact: license@bookos.dev
-EOF
+class Rect:
+    """QuickDraw Rectangle"""
+    def __init__(self, left=0, top=0, right=0, bottom=0):
+        self.left = left
+        self.top = top
+        self.right = right
+        self.bottom = bottom
+        
+    def Pack(self):
+        """Pack to Mac format"""
+        return struct.pack('>HHHH', self.top, self.left, self.bottom, self.right)
 
-cat > README.md << 'EOF'
-# Book OS + Legacy Scroll Platform
+class Point:
+    """QuickDraw Point"""
+    def __init__(self, v=0, h=0):
+        self.v = v
+        self.h = h
 
-## What's Included
+# ========== MAIN ==========
 
-1. **Book OS Engine** – Python Flask app with REST API and web UI. Transforms any book into a 90-day curriculum.
-2. **Legacy Scroll App** – React Native / Expo mobile app that consumes the curriculum.
-
-## Quick Start
-
-### Book OS Engine
-bash
-cd book_os_engine
-pip install -r requirements.txt
-python app.py
-# Open http://localhost:5000
-
-### Legacy Scroll App
-bash
-cd legacy-scroll-app
-npm install
-npm start
-
-## API Endpoints
-
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/api/books` | GET | List all books |
-| `/api/generate` | POST | Generate curriculum from selected books |
-| `/api/export` | POST | Download curriculum as JSON |
-
-## Licensing
-
-Non-exclusive perpetual license: **$25,000** (one-time, unlimited use, source code included)
-Contact: license@bookos.dev
-EOF   at it's most profitable form even if we have to rework it whats the  real value to a software broker
-
-
-
-
-
+if __name__ == "__main__":
+    # Create QuickDraw instance
+    qd = QuickDraw(512, 342)
+    
+    # Draw test pattern
+    qd.test_pattern()
+    
+    # Show the window
+    print("QuickDraw System 1.0 - Classic Mac Graphics Engine")
+    print("Drawing test pattern...")
+    qd.show() # File structure:
+macos-python/
+├── core/
+│   ├── quickdraw.py     # ✅ Done (500 lines)
+│   ├── memory.py        # ⬅️ Next (400 lines)
+│   ├── events.py        # ⬅️ Then (350 lines)
+│   ├── windows.py       # ⬅️ Then (800 lines)
+│   ├── menus.py         # (300 lines)
+│   ├── controls.py      # (400 lines)
+│   ├── dialog.py        # (500 lines)
+│   ├── resources.py     # (500 lines)
+│   ├── files.py         # (600 lines)
+│   ├── fonts.py         # (300 lines)
+│   └── system.py        # (400 lines)
+├── apps/
+│   ├── finder.py        # (1500 lines)
+│   ├── calculator.py    # (200 lines)
+│   ├── notepad.py       # (300 lines)
+│   ├── puzzle.py        # (250 lines)
+│   └── scrapbook.py     # (300 lines)
+├── desk accessories/
+│   ├── alarmclock.py    # (150 lines)
+│   ├── keycaps.py       # (200 lines)
+│   └── controlpanel.py  # (400 lines)
+└── boot.py              # (100 lines)
+b
 
 
 
