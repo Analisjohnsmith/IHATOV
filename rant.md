@@ -138,6 +138,9 @@ y'all can play with my toy in the mean time
 
 I ain't phased,
 
+
+https://www.reddit.com/r/Zhaived/s/bJgPQWq018
+
 I'll have to learn Japanese alittle to understand the harder concepts. Really, I'll likely use the original texts for the game . as long as it's safe to use. There will be transliteration and allot of it.
 
 That's how i plan to spend my time while i twiddle my thumbs , when i software broker..I have a publicly available tool that can make characters and worlds alive.
