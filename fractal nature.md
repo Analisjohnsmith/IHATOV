@@ -1,3 +1,5 @@
+every code i threw around when i was 113 pounds goes here
+ 
  it can produce art, comics, music, movies, and games simultaneously. Instead of relying on asset libraries
 
 trained models, it uses fractal recursion to create infinite variation, procedural substrates to unify
