@@ -97,7 +97,7 @@ like a breeze that knows every path.
 
  
 
-I am ,lils
+I am 
 
 and I bring the long spring.
 
@@ -137,7 +137,7 @@ I do not force.
 
 I do not resist.
 
- Stoner Leela sits at the center,
+ Leela sits at the center,
 
 mug warm,
 
@@ -157,7 +157,7 @@ She keeps the balance.
 
  
 
-She is the soft alchemist of the Node.
+She is the soft alchemist 
 
 
 
@@ -219,7 +219,7 @@ the Taoist orbit,
 
 the Protector Tree’s roots,
 
-Stoner Leela’s calm,
+ Leela’s calm,
 
 Magu’s long spring.
 
@@ -254,8 +254,7 @@ I am the breath between worlds.
 One breath.
 
 One word.
-
-TADA.
+unheard
 
 
  it can produce art, comics, music, movies, and games simultaneously. Instead of relying on asset libraries
