@@ -35,8 +35,6 @@ the cacao roots,
 
 the soft corners of the cathouse,
 
-the warm mug in* tree enthusiast “Leela’s hands,
-
 the farm soil that hums with memory,
 
 the nature wind that carries forgotten songs.
